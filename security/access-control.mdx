@@ -1,0 +1,169 @@
+---
+title: "Access Control for Operators and Services in CHIP"
+sidebarTitle: "Access Control"
+description: "Learn how CHIP manages operator and service access through SSH key management, RBAC, MFA, VPN requirements, and the service account authentication model."
+---
+
+CHIP enforces strict, auditable access controls for every human operator and automated service that interacts with the platform. Access is never granted implicitly — every operator must authenticate through the CHIP identity system, and every service must present a valid credential before communicating with another service. Permissions are scoped to the minimum required for a given role, and all access events are recorded in the centralized audit log. This document explains how access is structured, provisioned, and maintained for both human operators and automated services.
+
+## Access Control Model
+
+CHIP uses role-based access control (RBAC) at every layer:
+
+| Role | Scope | Typical Holder |
+|---|---|---|
+| `Platform Admin` | Full control-plane access, SSH to all hosts, all services | Senior platform engineers |
+| `Operator` | SSH to assigned host groups, read-only control-plane, service restarts | L2/L3 ops engineers |
+| `Developer` | Read-only control-plane, Kubernetes namespace access, log and metric access | Application developers |
+| `Security Auditor` | Read-only access to audit logs, vulnerability reports, RBAC configuration | Security team members |
+| `Service Account` | API access scoped to a specific service; no SSH access | Automated services and pipelines |
+
+Roles are assigned and audited through the CHIP control plane under **Settings → Identity → Users**.
+
+<Warning>
+Never share your CHIP credentials, SSH private keys, or service account tokens with another person or team. Shared credentials undermine auditability — every action must be traceable to an individual identity. If a colleague needs access, provision a new account or service account following the process below. If you suspect a credential has been compromised, revoke it immediately via **Settings → Identity → Users → Revoke Access** and open a security incident ticket.
+</Warning>
+
+## Human Access vs Service Account Access
+
+<Tabs>
+  <Tab title="Human Operator Access">
+    ### Authentication for Human Operators
+
+    Human operators authenticate to CHIP infrastructure through two paths:
+
+    **CHIP Control Plane (Web UI / API)**
+
+    All access to the CHIP control plane requires:
+    1. Username and password via the CHIP SSO portal
+    2. A valid second factor (TOTP via an authenticator app or a hardware security key — FIDO2/WebAuthn is preferred)
+
+    Sessions are valid for 8 hours. API access uses short-lived tokens (1-hour TTL) obtained via the SSO exchange. Long-lived personal access tokens are not supported for human operators.
+
+    **SSH Access to Hosts**
+
+    Direct SSH access uses key-based authentication only. Password authentication is disabled globally on all CHIP-managed hosts. Operator SSH public keys are managed centrally and distributed via the CHIP configuration management layer.
+
+    - Each operator has exactly one active SSH keypair per device
+    - Private keys must be protected with a passphrase
+    - Key rotation is enforced annually via the CHIP key management system, which sends automated reminders 30 days before the rotation deadline
+    - All SSH sessions are logged via `sshd` audit logging, and session activity is recorded for privileged hosts
+
+    **Sudo Policy**
+
+    Sudo access is role-based and managed in the central `sudoers` configuration deployed by CHIP config management:
+
+    | Role | Sudo Rights |
+    |---|---|
+    | `Platform Admin` | `NOPASSWD: ALL` (with mandatory audit logging) |
+    | `Operator` | Password-required sudo limited to a defined command list (service restarts, log rotation, etc.) |
+    | `Developer` | No sudo access on infrastructure hosts |
+
+    Sudo commands are captured in the OS audit log (`/var/log/auth.log`, forwarded to Loki's audit stream).
+
+    ### MFA Requirements
+
+    MFA is mandatory for all human access to the CHIP control plane and is enforced at the SSO layer — there is no way to bypass it. Supported second factors:
+
+    - **TOTP** (Google Authenticator, Authy, 1Password, Bitwarden) — minimum 6-digit code
+    - **FIDO2 / WebAuthn hardware key** (YubiKey, Titan Key) — strongly recommended for `Platform Admin` role holders
+    - **Push notification** (if your organisation has integrated an IdP with push MFA such as Okta or Duo)
+
+    Recovery codes are generated at enrollment and must be stored securely (e.g., in a personal password manager). Recovery code use is always logged and triggers a security review notification.
+
+    ### VPN Requirements
+
+    Direct SSH access to infrastructure hosts and access to internal management interfaces (Grafana, Alertmanager, Loki, CHIP control plane internal endpoints) require an active VPN connection. The CHIP VPN gateway uses WireGuard. VPN profiles are provisioned as part of operator onboarding and are tied to the operator's identity — profile sharing is prohibited.
+
+    Remote operators must:
+    - Connect to the CHIP VPN before initiating any SSH session
+    - Use split-tunnel configuration that routes only CHIP management subnets through the VPN
+    - Re-authenticate the VPN session after 12 hours of inactivity
+  </Tab>
+
+  <Tab title="Service Account Access">
+    ### Service Account Model
+
+    Services that need to interact with the CHIP platform (e.g., a deployment pipeline writing to a registry, an application reading secrets from Vault, or a monitoring agent calling the CHIP API) must use a dedicated service account rather than a human operator's credentials.
+
+    **How Service Accounts Authenticate**
+
+    Service accounts use one of the following credential types depending on the integration:
+
+    | Credential Type | Use Case | TTL / Rotation |
+    |---|---|---|
+    | Short-lived API token | CHIP control-plane API access from CI/CD | 1 hour, issued on demand via OAuth2 client credentials flow |
+    | Kubernetes Service Account token | Pod-to-API communication within Kubernetes | Managed by Kubernetes, auto-rotated |
+    | Vault AppRole | Application-to-Vault secret access | Secret ID TTL: 24 hours; auto-rotated by CHIP sidecar |
+    | mTLS client certificate | Service-to-service mutual authentication | 24-hour cert TTL, issued by CHIP internal CA |
+    | Static long-lived token | Legacy integrations only (requires security exception) | 90-day max, stored in Vault |
+
+    **Service Account Permissions**
+
+    Service accounts follow the same RBAC model as human operators but are scoped to specific resources. When creating a service account, you specify:
+    - The API scopes the account needs (e.g., `metrics:read`, `deployments:write:production`)
+    - The source IP or Kubernetes namespace allowed to use the account
+    - An expiry date (mandatory; maximum 1 year)
+
+    **Secrets for Service Accounts**
+
+    All service account credentials (API tokens, Vault AppRole secret IDs, TLS private keys) are stored in HashiCorp Vault. Applications retrieve credentials at runtime via the Vault Agent sidecar or the Vault SDK — credentials are never baked into container images or stored in environment variables in source control.
+
+    ```bash
+    # Example: Retrieve a service account token from Vault at runtime
+    vault read auth/approle/login \
+      role_id="${VAULT_ROLE_ID}" \
+      secret_id="${VAULT_SECRET_ID}"
+    ```
+
+    Service account activity is logged via the Vault audit backend and the CHIP control-plane audit log. Any service account that has not been used for 30 days is automatically disabled pending review.
+  </Tab>
+</Tabs>
+
+## Provisioning Access for a New Operator
+
+<Steps>
+  <Step title="Submit an access request">
+    The new operator's manager submits an access request ticket using the **CHIP-ACCESS** template in the internal ticketing system. The request must specify the operator's name, email, required CHIP role (`Operator` or `Platform Admin`), and which host groups they need SSH access to.
+  </Step>
+  <Step title="Create the user account">
+    A `Platform Admin` creates the user in the CHIP control plane under **Settings → Identity → Users → Invite User**. Enter the operator's email address and select their role. CHIP sends an invitation email with a one-time setup link valid for 24 hours.
+  </Step>
+  <Step title="Operator completes enrollment">
+    The new operator clicks the setup link, sets their password, and enrolls a second factor (TOTP or hardware key). They also generate their SSH keypair locally and upload the public key through the CHIP control plane under **Profile → SSH Keys → Add Key**.
+
+    ```bash
+    # Generate a new SSH keypair (operator runs this locally)
+    ssh-keygen -t ed25519 -C "operator@example.com" -f ~/.ssh/chip_ed25519
+    # Protect the private key with a strong passphrase when prompted
+    ```
+  </Step>
+  <Step title="Configure host group SSH access">
+    A `Platform Admin` assigns the operator to the relevant host groups in **Settings → Identity → Host Groups**. CHIP's configuration management layer pushes the operator's public key to the `authorized_keys` file on all hosts in those groups within the next configuration run (typically within 5 minutes).
+  </Step>
+  <Step title="Provision the VPN profile">
+    A `Platform Admin` generates a WireGuard VPN profile for the operator in **Settings → VPN → Users → Generate Profile**. Download the `.conf` file and share it with the operator over an encrypted channel (Signal, 1Password shared item, or similar). The operator imports it into their WireGuard client.
+  </Step>
+  <Step title="Verify access and update the access registry">
+    Ask the operator to confirm they can log in to the CHIP control plane with MFA, connect to the VPN, and SSH to at least one assigned host. Update the access registry spreadsheet (linked in the CHIP runbooks) with the operator's details and provisioning date.
+  </Step>
+</Steps>
+
+## Access Reviews and Off-boarding
+
+CHIP performs a quarterly access review during which all operator accounts and service accounts are validated against current employment and project requirements:
+
+- Accounts belonging to former employees are revoked immediately upon HR notification; SSH keys are removed from all hosts in the next configuration run
+- Service accounts not used in the last 30 days are disabled and flagged for deletion
+- `Platform Admin` role holders are reviewed for continued justification every 90 days
+
+When an operator leaves, the off-boarding checklist must include:
+- [ ] CHIP control-plane account disabled and then deleted
+- [ ] SSH public key removed from all host groups
+- [ ] VPN profile revoked in the WireGuard gateway
+- [ ] Any Vault secrets the operator had direct access to rotated
+- [ ] PagerDuty on-call schedule updated to remove the departing operator
+
+<Tip>
+The CHIP access review dashboard (available to `Platform Admin` and `Security Auditor` roles) at **Settings → Identity → Access Review** shows all active accounts, last login timestamps, and assigned roles in one view. Run this report before each quarterly review to identify stale accounts efficiently.
+</Tip>

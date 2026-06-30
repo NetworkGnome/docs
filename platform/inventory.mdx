@@ -1,0 +1,215 @@
+---
+title: "CHIP Infrastructure Inventory: Hosts, Roles, and Nodes"
+sidebarTitle: "Inventory"
+description: "The CHIP inventory is the authoritative record of every managed host, its role, environment, hardware profile, and network assignment in the platform."
+---
+
+The CHIP inventory is the single source of truth for every system the platform manages. Before a host is assigned an IP address, provisioned with an OS, or assigned a workload, it is registered here with its hardware specification, logical role, environment classification, and network placement. This discipline ensures that no node is "off the books" — every resource that consumes power, network ports, or IP addresses is documented, owned, and observable. This page explains how the inventory is structured, how nodes are classified, and what fields a complete host entry contains.
+
+## Inventory Structure
+
+The inventory is organized along three orthogonal axes: **hosts**, **roles**, and **environments**. A given host belongs to exactly one environment, fulfills one primary role, and may carry one or more secondary roles to capture additional capabilities.
+
+<CardGroup cols={3}>
+  <Card title="Hosts" icon="server">
+    Individual physical or virtual machines. Each host entry captures hardware specs, network config, and service assignments.
+  </Card>
+  <Card title="Roles" icon="tag">
+    The functional purpose of a host — hypervisor, router, DNS server, monitoring, storage, application, etc.
+  </Card>
+  <Card title="Environments" icon="layer-group">
+    The operational context — production, staging, lab, or management. Environments drive firewall policy and change-control requirements.
+  </Card>
+</CardGroup>
+
+This three-axis model lets you answer operational questions naturally: "Which hosts run in the production environment?" "What services does `pve-node-01` provide?" "Which nodes are classified as storage devices?"
+
+---
+
+## Host Inventory Table
+
+The table below represents the current managed host roster. All entries are maintained in the repository and kept in sync with observed infrastructure state.
+
+| Hostname | Role | Type | Environment | IP Range |
+|---|---|---|---|---|
+| `pve-node-01` | Hypervisor | Bare Metal | Production | 10.0.10.11 |
+| `pve-node-02` | Hypervisor | Bare Metal | Production | 10.0.10.12 |
+| `pve-node-03` | Hypervisor | Bare Metal | Lab | 10.0.10.13 |
+| `router-01` | Gateway / Firewall | Bare Metal | Management | 10.0.10.1 |
+| `sw-core-01` | Core Switch | Network Device | Management | 10.0.10.2 |
+| `sw-access-01` | Access Switch | Network Device | Management | 10.0.10.3 |
+| `dns-01` | DNS / DHCP | LXC Container | Production | 10.0.10.20 |
+| `vault-01` | Secrets Management | VM | Production | 10.0.10.21 |
+| `monitoring-01` | Observability Stack | VM | Production | 10.0.10.22 |
+| `proxy-01` | Reverse Proxy | LXC Container | Production | 10.0.40.10 |
+| `storage-01` | NAS / NFS Server | VM | Production | 10.0.50.10 |
+| `app-staging-01` | Application Host | VM | Staging | 10.0.20.100 |
+| `iot-bridge-01` | IoT Gateway | VM | Production | 10.0.30.10 |
+
+<Info>
+  Static IP assignments for all managed hosts are defined in the DHCP reservation table and cross-referenced against entries here. An IP that appears in one place and not the other is a documentation gap that should be resolved immediately.
+</Info>
+
+---
+
+## Node Classification
+
+CHIP recognizes five primary node types. Each type carries a distinct set of expected properties, monitoring requirements, and change-management workflows.
+
+<Accordion title="Hypervisors">
+  Hypervisor nodes are bare-metal machines running **Proxmox VE**. They form the compute substrate for all virtual machines and LXC containers in the platform. Every hypervisor node must have:
+
+  - A VLAN trunk port connecting it to the core switch, carrying all relevant VLANs
+  - At least two physical NICs (management NIC + data NIC, or bonded pair)
+  - ZFS storage pools defined and named consistently across the cluster
+  - Proxmox node joined to the cluster before any VMs are created
+
+  **Inventory fields:** `hostname`, `pve_node_id`, `cpu_model`, `cpu_cores`, `ram_gb`, `disk_layout`, `nic_count`, `storage_pools[]`, `vlan_trunk[]`
+
+  **Monitoring:** Node exporter, Proxmox exporter, ZFS pool health, NIC throughput
+</Accordion>
+
+<Accordion title="Virtual Machines (VMs)">
+  Virtual machines are full OS instances provisioned on a hypervisor node. They are used for workloads that require kernel-level isolation, custom kernel modules, or Windows Server instances. Each VM is assigned a VMID, a home node (for placement), and a resource profile.
+
+  **Inventory fields:** `hostname`, `vmid`, `pve_node`, `vcpus`, `ram_mb`, `disk_gb`, `vlan_id`, `ip_address`, `template_source`, `role`, `environment`
+
+  **Monitoring:** Node exporter, application-specific exporters, Docker cAdvisor if running containers
+</Accordion>
+
+<Accordion title="LXC Containers">
+  LXC (Linux Container) instances run on Proxmox and share the hypervisor kernel. They are lighter than full VMs and preferred for stateless or low-footprint platform services (DNS, reverse proxy, simple daemons). LXC containers are not suitable for workloads requiring custom kernel modules or privileged hardware access.
+
+  **Inventory fields:** `hostname`, `ctid`, `pve_node`, `vcpus`, `ram_mb`, `disk_gb`, `vlan_id`, `ip_address`, `role`, `environment`, `unprivileged`
+
+  **Monitoring:** Node exporter (where supported), log forwarding to Loki
+</Accordion>
+
+<Accordion title="Network Devices">
+  Network devices include managed switches, routers, firewalls, and wireless access points. Unlike compute nodes, network devices are configured via their own management interfaces (web UI, CLI, or API) and documented in the inventory with their management IP, firmware version, and port/VLAN assignments.
+
+  **Inventory fields:** `hostname`, `device_type`, `model`, `firmware_version`, `mgmt_ip`, `mgmt_vlan`, `uplinks[]`, `vlan_config_source`
+
+  **Monitoring:** SNMP polling (interface counters, error rates), syslog forwarding to Loki, ping health checks
+</Accordion>
+
+<Accordion title="Storage Nodes">
+  Storage nodes provide shared storage services consumed by hypervisors, VMs, and containers. This includes NFS servers, iSCSI targets, and S3-compatible object stores. Storage nodes are typically VMs or bare-metal machines with dedicated disk controllers and large raw disk capacity.
+
+  **Inventory fields:** `hostname`, `storage_type`, `disk_count`, `raw_tb`, `exported_shares[]`, `consumers[]`, `backup_policy`
+
+  **Monitoring:** Disk health (SMART), filesystem utilization, NFS/iSCSI throughput, ZFS arc hit rate
+</Accordion>
+
+---
+
+## Example Host Entry
+
+Below is a representative host entry for a Proxmox hypervisor node as it would be declared in the inventory. All fields are required for the node to be considered fully documented.
+
+```yaml
+# inventory/hosts/pve-node-01.yml
+hostname: pve-node-01
+display_name: "Proxmox Hypervisor Node 01"
+role: hypervisor
+secondary_roles:
+  - nfs-client
+  - metrics-target
+environment: production
+type: bare-metal
+
+hardware:
+  cpu_model: "AMD Ryzen 9 5950X"
+  cpu_cores: 16
+  cpu_threads: 32
+  ram_gb: 128
+  nic_count: 2
+  nics:
+    - name: eno1
+      speed: 2.5GbE
+      purpose: management
+      vlan: 10
+    - name: eno2
+      speed: 10GbE
+      purpose: data-trunk
+      vlans: [10, 20, 30, 40, 50]
+
+storage:
+  pools:
+    - name: local-zfs
+      type: zfs
+      disks: ["nvme0n1", "nvme1n1"]
+      raid: mirror
+      usable_tb: 1.8
+    - name: data-zfs
+      type: zfs
+      disks: ["sda", "sdb", "sdc", "sdd"]
+      raid: raidz1
+      usable_tb: 10.9
+
+network:
+  mgmt_ip: 10.0.10.11
+  mgmt_vlan: 10
+  gateway: 10.0.10.1
+  dns: 10.0.10.20
+
+proxmox:
+  node_id: 1
+  cluster: chip-cluster
+  joined: true
+
+services:
+  - prometheus-node-exporter
+  - proxmox-ve
+
+monitoring:
+  node_exporter_port: 9100
+  proxmox_exporter_port: 9221
+  scrape_interval: 15s
+
+notes: "Primary hypervisor. Hosts all production VMs. Do not schedule maintenance without migrating active VMs first."
+```
+
+<Warning>
+  Never remove a host entry from the inventory without first decommissioning the physical or virtual node. Stale inventory entries are preferable to undocumented live nodes. Use a `status: decommissioned` field to retire entries without losing historical context.
+</Warning>
+
+---
+
+## Inventory Categories
+
+Beyond node type, CHIP uses categories to group hosts by operational concern. Categories are non-exclusive — a host may appear in multiple categories.
+
+| Category | Description | Example Members |
+|---|---|---|
+| `cluster-members` | Nodes joined to the Proxmox cluster | pve-node-01, pve-node-02, pve-node-03 |
+| `platform-services` | Hosts running core platform utilities | dns-01, vault-01, monitoring-01 |
+| `internet-facing` | Nodes with public IP or DMZ placement | proxy-01 |
+| `storage-providers` | Nodes exporting shared storage | storage-01 |
+| `iot-boundary` | Nodes bridging the IoT and trusted networks | iot-bridge-01 |
+| `mgmt-plane` | Network and management infrastructure | router-01, sw-core-01 |
+
+<Tip>
+  Use categories as the basis for Ansible inventory groups, Prometheus scrape target sets, and Grafana dashboard filters. Defining them once in the CHIP inventory and deriving downstream groupings from it keeps everything consistent.
+</Tip>
+
+---
+
+## Keeping Inventory Current
+
+The inventory is only valuable if it accurately reflects reality. CHIP recommends the following practices to prevent drift:
+
+<Steps>
+  <Step title="Register Before Provisioning">
+    Add a host entry to the inventory before you power on the physical machine or create the VM. Assign the hostname, IP, VLAN, and role in advance. This prevents ad-hoc assignments made under pressure.
+  </Step>
+  <Step title="Validate on First Boot">
+    After provisioning, run the CHIP inventory validation script to confirm that the node's reported hardware matches the declared spec, that its IP matches the DHCP reservation, and that its monitoring agent is reachable.
+  </Step>
+  <Step title="Update on Change">
+    Any time a node's hardware, role, or IP changes — open a pull request against the inventory file before making the change in production. The PR description becomes the change record.
+  </Step>
+  <Step title="Audit Quarterly">
+    Run a full inventory audit every quarter by cross-referencing the declared inventory against the Proxmox cluster API, the DHCP lease table, and Prometheus scrape targets. Resolve discrepancies within the same sprint.
+  </Step>
+</Steps>

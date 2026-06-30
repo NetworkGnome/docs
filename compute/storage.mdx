@@ -1,0 +1,253 @@
+---
+title: "Storage Architecture, Pools & Management in CHIP"
+sidebarTitle: "Storage"
+description: "CHIP storage tiers, pool reference, ZFS and Ceph backends, snapshot policies, backup targets, and procedures for adding and managing VM storage."
+---
+
+Storage in CHIP is organised into distinct tiers and backends, each tuned for a specific combination of throughput, latency, capacity, and redundancy requirements. Understanding which pool to use — and why — prevents both performance bottlenecks and unexpected data loss. This page describes every active storage pool, explains the tiering model, and walks you through the procedures for adding storage to VMs, managing ZFS datasets, and operating backup targets safely.
+
+## Storage Tiers
+
+CHIP defines three performance tiers. Every storage pool is assigned to exactly one tier, and each tier has a defined set of acceptable workloads.
+
+<CardGroup cols={3}>
+  <Card title="Tier 1 — NVMe Flash" icon="bolt">
+    **Backends:** `ceph-rbd` (NVMe OSDs), `local-lvm` (node-local NVMe)
+
+    Sub-millisecond latency, up to 1M IOPS per node. For latency-sensitive production workloads: database primaries, message queues, real-time APIs.
+  </Card>
+  <Card title="Tier 2 — SAS SSD" icon="server">
+    **Backends:** `zfs-tank` (RAIDZ2 on SAS SSD), `ceph-rbd` (SSD OSDs)
+
+    2–5 ms average latency, high sequential throughput. For general application storage, container root filesystems, build artefacts, log aggregation targets.
+  </Card>
+  <Card title="Tier 3 — Archive / NFS" icon="archive">
+    **Backends:** `nfs-backup`, `nfs-archive`
+
+    Spinning-disk NAS over NFS. Not suitable for live VM disks. For backup images, ISO library, compliance archives, long-term retention data.
+  </Card>
+</CardGroup>
+
+<Warning>
+  When any Proxmox storage pool reaches **85% utilisation**, Proxmox begins throttling write operations on that pool. At **95% utilisation**, all VMs with disks on the affected pool are **automatically suspended** to prevent filesystem corruption — even if the VMs themselves have free space. Monitor pool utilisation in the **Datacenter → Storage** view and raise a capacity request when any pool exceeds 70%.
+</Warning>
+
+## Storage Pool Reference
+
+| Pool Name       | Backend     | Node(s)               | Raw Capacity | Usable Capacity | Purpose                                   | VLAN          |
+|-----------------|-------------|-----------------------|--------------|-----------------|-------------------------------------------|---------------|
+| `local-lvm`     | LVM-thin    | All nodes (per-node)  | 3.8 TB/node  | 3.4 TB/node     | Node-local VM disks (non-HA)              | N/A (local)   |
+| `ceph-rbd`      | Ceph RBD    | All 5 nodes (pool)    | 38 TB raw    | 12.7 TB (3× rep)| HA VM disks, live migration               | VLAN 40       |
+| `zfs-tank`      | ZFS RAIDZ2  | pve-node-01–03        | 23 TB raw    | 15 TB           | LXC root FS, secondary VM disks           | N/A (local)   |
+| `nfs-backup`    | NFS (NAS)   | storage-01.chip.internal | 96 TB    | 80 TB           | PBS backup targets, ISO library           | VLAN 40       |
+| `nfs-archive`   | NFS (NAS)   | storage-02.chip.internal | 192 TB   | 160 TB          | Long-term compliance archives (7-yr ret.) | VLAN 40       |
+| `ceph-fs`       | CephFS      | All 5 nodes (pool)    | 38 TB raw    | 12.7 TB (3× rep)| Shared read-write mounts for app clusters | VLAN 40       |
+
+<Info>
+  All storage traffic between nodes uses VLAN 40 (`10.40.0.0/24`, bridge `vmbr4`). This network is isolated from VM workload traffic to prevent storage I/O from impacting inter-VM communication and vice versa. Never route general application traffic over VLAN 40.
+</Info>
+
+## Adding Storage to a VM
+
+<Steps>
+  <Step title="Determine the appropriate storage pool">
+    Before adding a disk, decide which tier and pool the disk belongs to based on your workload's I/O pattern. Use `ceph-rbd` if the VM must be HA-eligible or migrate between nodes; use `local-lvm` for ephemeral scratch disks on non-HA VMs. Refer to the [Storage Pool Reference](#storage-pool-reference) table above.
+  </Step>
+  <Step title="Add the disk via the web UI">
+    In the Proxmox web UI, select your VM from the resource tree. Navigate to **Hardware → Add → Hard Disk**. Set:
+    - **Storage:** select the target pool (e.g., `ceph-rbd`)
+    - **Disk size (GiB):** enter the required size in whole GiB
+    - **Bus/Device:** use `VirtIO Block` (`virtio1`, `virtio2`, etc.) for Linux guests; use `SCSI` for Windows
+    - **Discard:** enable for thin-provisioned pools (`local-lvm`, `ceph-rbd`) so guest TRIM commands reclaim space
+    - **Async IO:** set to `io_uring` for best performance on modern kernels
+
+    Click **Add** to attach the disk. The disk is immediately visible to the hypervisor but requires OS-side configuration.
+  </Step>
+  <Step title="Alternatively, add via CLI">
+    ```bash
+    # Add a 100 GB VirtIO disk on ceph-rbd to VM 200
+    qm set 200 --virtio1 ceph-rbd:100,discard=on,iothread=1
+
+    # Verify the hardware config
+    qm config 200 | grep virtio
+    ```
+  </Step>
+  <Step title="Partition and format the new disk inside the VM">
+    Connect to the VM via SSH or the Proxmox console and initialise the disk:
+
+    ```bash
+    # Identify the new block device (typically /dev/vdb for virtio1)
+    lsblk
+
+    # Create a GPT partition table and a single partition
+    parted /dev/vdb mklabel gpt
+    parted /dev/vdb mkpart primary ext4 0% 100%
+
+    # Format the partition
+    mkfs.ext4 /dev/vdb1
+
+    # Create a mount point and mount
+    mkdir -p /data
+    mount /dev/vdb1 /data
+
+    # Add to /etc/fstab for persistence (use UUID, not device path)
+    blkid /dev/vdb1
+    echo "UUID=<uuid-from-blkid> /data ext4 defaults,discard 0 2" >> /etc/fstab
+    ```
+  </Step>
+  <Step title="Verify disk visibility and quota">
+    Confirm the disk is listed in the VM hardware summary and that the used capacity is reflected in the pool's utilisation dashboard under **Datacenter → Storage → ceph-rbd**. If the pool utilisation exceeds 70% after adding the disk, open a capacity request with the infrastructure team.
+  </Step>
+</Steps>
+
+## ZFS Dataset Management
+
+`zfs-tank` is a RAIDZ2 pool on nodes `pve-node-01` through `pve-node-03` built from twelve 4 TB SAS SSD drives (6 per node, spanning two nodes for redundancy via ZFS dRAID in a future migration). The current layout uses per-node RAIDZ2 with cross-node Zrepl replication.
+
+### Useful ZFS Commands
+
+```bash
+# Show pool health and capacity
+zpool status zfs-tank
+zpool list zfs-tank
+
+# List all datasets
+zfs list -r zfs-tank
+
+# Create a dataset for a new application
+zfs create zfs-tank/app/myapp
+zfs set quota=200G zfs-tank/app/myapp
+zfs set recordsize=16K zfs-tank/app/myapp   # Tune for database workloads
+zfs set compression=lz4 zfs-tank/app/myapp  # Enable compression (default on all new datasets)
+
+# View dataset properties
+zfs get all zfs-tank/app/myapp
+```
+
+### ZFS Dataset Snapshot Policy
+
+Snapshots are taken automatically by `zrepl` according to the following retention schedule. You can also take manual snapshots before risky operations.
+
+| Frequency  | Retention | Naming Pattern                         |
+|------------|-----------|----------------------------------------|
+| Every hour | 24 hours  | `zfs-tank/ds@zrepl_hourly_<timestamp>` |
+| Daily      | 14 days   | `zfs-tank/ds@zrepl_daily_<timestamp>`  |
+| Weekly     | 8 weeks   | `zfs-tank/ds@zrepl_weekly_<timestamp>` |
+| Monthly    | 12 months | `zfs-tank/ds@zrepl_monthly_<timestamp>`|
+
+```bash
+# Take a manual snapshot before a risky change
+zfs snapshot zfs-tank/app/myapp@before-upgrade-$(date +%Y%m%d)
+
+# List snapshots for a dataset
+zfs list -t snapshot zfs-tank/app/myapp
+
+# Roll back to a snapshot (destroys all changes since snapshot)
+zfs rollback zfs-tank/app/myapp@before-upgrade-20250110
+
+# Destroy a snapshot when no longer needed
+zfs destroy zfs-tank/app/myapp@before-upgrade-20250110
+```
+
+<Warning>
+  `zfs rollback` to a non-most-recent snapshot requires destroying all intervening snapshots unless you use the `-r` flag, which also destroys descendant snapshots. Always verify your target snapshot name with `zfs list -t snapshot` before rolling back. This operation cannot be undone.
+</Warning>
+
+## Ceph Storage Management
+
+The `ceph-rbd` and `ceph-fs` pools are backed by a five-node Ceph cluster co-located with the Proxmox hosts. Each node contributes its NVMe drives as Ceph OSDs.
+
+```bash
+# Check overall Ceph cluster health
+ceph health detail
+
+# Show OSD utilisation across all nodes
+ceph osd df tree
+
+# Show pool usage
+ceph df
+
+# Check replication status (should show 0 degraded/misplaced under normal conditions)
+ceph pg stat
+```
+
+<Accordion title="Ceph pool configuration">
+  | Pool Name     | Replication Factor | Min Size | CRUSH Rule       | Application |
+  |---------------|--------------------|----------|------------------|-------------|
+  | `vm-disks`    | 3                  | 2        | `chip-host-rule` | rbd         |
+  | `vm-metadata` | 3                  | 2        | `chip-host-rule` | rbd         |
+  | `cephfs-data` | 3                  | 2        | `chip-host-rule` | cephfs      |
+  | `cephfs-meta` | 3                  | 2        | `chip-host-rule` | cephfs      |
+
+  The `chip-host-rule` CRUSH rule ensures replicas are placed on physically separate hosts, not just separate OSDs. This means the cluster can survive the complete loss of any single Proxmox node without data loss.
+</Accordion>
+
+<Accordion title="Expanding Ceph capacity">
+  When adding new OSDs to expand the Ceph cluster:
+
+  ```bash
+  # Identify the new disk (run on the target node)
+  lsblk --fs
+
+  # Wipe the disk before adding as an OSD
+  ceph-volume lvm zap /dev/nvme2n1 --destroy
+
+  # Create a new OSD
+  ceph-volume lvm create --data /dev/nvme2n1
+
+  # Monitor rebalancing progress
+  watch ceph -s
+  ```
+
+  Rebalancing begins automatically after a new OSD is added. Do not add multiple OSDs simultaneously on the same node — stagger additions by at least 30 minutes to avoid overwhelming the rebalance I/O budget.
+</Accordion>
+
+## Backup Storage Targets
+
+All VM and container backups are written to `nfs-backup`, which is fronted by Proxmox Backup Server (PBS) running on `pbs-01.chip.internal`.
+
+### Backup Job Schedule
+
+| Job Name             | Scope                     | Schedule     | Retention         | Target Storage  |
+|----------------------|---------------------------|--------------|-------------------|-----------------|
+| `prod-daily`         | All VMs in production pools | 02:00 daily | 14 daily, 4 weekly| `nfs-backup`    |
+| `stg-weekly`         | All VMs in staging pools  | 03:00 Sunday | 4 weekly          | `nfs-backup`    |
+| `dev-weekly`         | All VMs in dev pools      | 04:00 Sunday | 2 weekly          | `nfs-backup`    |
+| `infra-daily`        | Infrastructure containers  | 01:00 daily  | 30 daily, 12 monthly| `nfs-backup`  |
+| `compliance-monthly` | Prod DBs and key services | 1st of month | 84 monthly (7 yr) | `nfs-archive`   |
+
+<Tip>
+  Before destroying any VM, verify a backup exists in PBS: log in to `https://pbs.chip.internal` and search by VM ID. The default backup job runs nightly, so if you created a VM and need to destroy it the same day, trigger a manual backup first with `vzdump <vmid> --storage nfs-backup --mode snapshot`.
+</Tip>
+
+### Shared Storage for HA VMs
+
+Virtual machines enrolled in Proxmox HA **must** have all their disks on `ceph-rbd`. If a VM has any disk on `local-lvm`, HA Manager cannot migrate it to a replacement node after a failure — the VM will remain in a faulted state until an operator manually intervenes.
+
+```bash
+# Check which storage a VM's disks use
+qm config <vmid> | grep -E "^(virtio|scsi|ide|sata)"
+
+# Move a disk from local-lvm to ceph-rbd (online, no downtime for running VMs)
+qm move-disk <vmid> virtio0 ceph-rbd --delete 1
+
+# Confirm migration
+qm config <vmid> | grep virtio0
+```
+
+## Storage Monitoring & Alerts
+
+Storage health metrics are exported to Prometheus via the `proxmox-exporter` and `node_exporter` running on each host. The following alert thresholds are active in Alertmanager:
+
+| Alert Name                  | Condition                              | Severity | Runbook                              |
+|-----------------------------|----------------------------------------|----------|--------------------------------------|
+| `StoragePoolHighUtilisation`| Any pool ≥ 70% full                   | Warning  | `runbooks/storage/pool-capacity.md`  |
+| `StoragePoolCritical`       | Any pool ≥ 85% full                   | Critical | `runbooks/storage/pool-capacity.md`  |
+| `ZpoolDegraded`             | zpool status != ONLINE                 | Critical | `runbooks/storage/zpool-degraded.md` |
+| `CephHealthWarn`            | `ceph health` != `HEALTH_OK`           | Warning  | `runbooks/storage/ceph-health.md`    |
+| `CephHealthErr`             | `ceph health` returns `HEALTH_ERR`     | Critical | `runbooks/storage/ceph-health.md`    |
+| `PBSDatastoreLow`           | PBS datastore free space < 10 TB       | Warning  | `runbooks/storage/pbs-capacity.md`   |
+
+<Note>
+  Runbooks are hosted in the internal GitLab repository at `gitlab.chip.internal/infra/runbooks`. All on-call engineers must review the storage runbooks during onboarding to ensure fast response times when alerts fire outside business hours.
+</Note>

@@ -1,0 +1,151 @@
+---
+title: "CHIP Network Architecture: Topology and Zones"
+sidebarTitle: "Overview"
+description: "Understand CHIP's physical and logical network design, including core switching, WAN boundary, inter-VLAN routing, and segmented network zones."
+---
+
+The CHIP network is a deliberately segmented, enterprise-style LAN built on managed switching infrastructure and a stateful firewall at the WAN/LAN boundary. Rather than placing all devices on a single flat network, CHIP divides traffic into named zones — each with its own subnet, VLAN, and inter-zone routing policy. This segmentation limits the blast radius of a compromised or misbehaving device, enforces least-privilege connectivity between workload classes, and gives you clear choke points where firewall rules can be applied and audited. This document covers the physical topology, the logical topology, the defined network zones, and the routing model that ties them together.
+
+## Physical Topology
+
+The physical network follows a two-tier collapsed-core design appropriate for a single-site infrastructure. A single managed core switch serves as the aggregation and distribution layer, with one or more access-layer switches providing device-facing ports.
+
+```
+                    ┌─────────────────┐
+                    │   WAN / ISP     │
+                    │  (Fiber / Cable)│
+                    └────────┬────────┘
+                             │ WAN uplink
+                    ┌────────▼────────┐
+                    │    Firewall     │
+                    │  (OPNsense /    │
+                    │   pfSense)      │
+                    └────────┬────────┘
+                             │ LAN trunk (802.1Q, all VLANs)
+                    ┌────────▼────────┐
+                    │  Core Switch    │
+                    │  (sw-core-01)   │
+                    │  Managed L2/L3  │
+                    └──┬──────────┬───┘
+                       │          │
+          ┌────────────▼──┐  ┌────▼────────────┐
+          │ Access Switch │  │   Hypervisor    │
+          │ (sw-access-01)│  │   Nodes (trunk) │
+          └───────┬───────┘  └─────────────────┘
+                  │
+         ┌────────┴──────────┐
+         │  End devices,     │
+         │  workstations,    │
+         │  IoT sensors, etc │
+         └───────────────────┘
+```
+
+<Info>
+  All inter-switch links and hypervisor uplinks operate as **802.1Q VLAN trunks**, carrying tagged traffic for every relevant VLAN. Access ports deliver a single untagged VLAN to end devices that are not VLAN-aware.
+</Info>
+
+### Core Switch
+
+`sw-core-01` is the central aggregation point for all managed network segments. Every VLAN is defined on this switch. It carries:
+
+- Uplink to the firewall (trunk, all VLANs)
+- Downlink to access switches (trunk, selected VLANs per switch)
+- Direct trunk ports to each hypervisor node
+- Management access to network devices via the Management VLAN
+
+### Access Switch
+
+`sw-access-01` provides lower-cost port density for end devices. Access ports are configured with a single untagged VLAN appropriate for the device type (Trusted LAN for workstations, IoT for sensors, etc.). The uplink to the core switch is a trunk.
+
+### WAN / ISP Boundary
+
+The firewall is the sole ingress/egress point for all internet traffic. It performs:
+
+- **NAT** — Translates RFC 1918 internal addresses to the public WAN IP
+- **Stateful inspection** — Tracks connection state for all flows crossing the WAN boundary
+- **IDS/IPS** — Optional inline threat detection on the WAN interface
+- **WireGuard VPN** — Terminates remote-access VPN tunnels for administrative access
+
+---
+
+## Logical Topology
+
+Logically, the network is divided into named zones. Each zone is realized as a distinct VLAN and IP subnet. The firewall controls all traffic that crosses zone boundaries — there is no direct routed path between zones that bypasses it.
+
+### Network Zones
+
+| Zone | VLAN | Subnet | Purpose |
+|---|---|---|---|
+| Management | 10 | 10.0.10.0/24 | Infrastructure management plane — switches, hypervisors, IPMI/iDRAC, router UI |
+| Trusted LAN | 20 | 10.0.20.0/24 | User workstations, laptops, trusted personal devices |
+| IoT | 30 | 10.0.30.0/24 | Smart home devices, sensors, cameras, embedded systems |
+| DMZ | 40 | 10.0.40.0/24 | Internet-facing services — reverse proxy, publicly reachable APIs |
+| Storage | 50 | 10.0.50.0/24 | NFS/iSCSI storage traffic — hypervisors and VMs only |
+| Native / Untagged | 99 | — | Default VLAN on unmanaged or unconfigured ports; no routing |
+
+<Warning>
+  The Native VLAN (99) carries no routed traffic. Any device that connects to a switch port and does not explicitly negotiate a VLAN tag ends up here — effectively quarantined from all managed zones. This is intentional. Do not add a subnet to VLAN 99.
+</Warning>
+
+### Zone Isolation Policy
+
+The default inter-zone policy is **deny-all**. Traffic between zones is only permitted when an explicit firewall rule allows it. The table below summarizes the standing inter-zone routing permissions:
+
+| Source Zone | Destination Zone | Policy | Notes |
+|---|---|---|---|
+| Management | All zones | Permit (admin) | Management hosts can reach everything for operational purposes |
+| Trusted LAN | Management | Deny | Workstations must not reach management interfaces directly |
+| Trusted LAN | Internet | Permit | Standard web browsing and cloud access |
+| Trusted LAN | DMZ | Permit (selected ports) | Access to internally-hosted services via reverse proxy |
+| IoT | All zones | Deny | IoT devices may only reach defined cloud update endpoints |
+| IoT | Internet | Permit (restricted) | Allow update/telemetry to vendor endpoints; block all else |
+| DMZ | Trusted LAN | Deny | Published services must not initiate connections into the LAN |
+| DMZ | Internet | Permit (outbound) | Services may call external APIs |
+| Storage | Management | Permit | Storage management plane access for monitoring and configuration |
+| Storage | All others | Deny | Storage traffic must not leak into workload or user zones |
+
+<Tip>
+  When you add a new service to the DMZ, start by defining the firewall rules you need before you deploy the service. Writing rules after the fact often leads to overly permissive policies created under time pressure.
+</Tip>
+
+---
+
+## Inter-VLAN Routing
+
+Inter-VLAN routing in CHIP is performed **exclusively at the firewall**. The core switch operates as a Layer 2 device — it switches within VLANs but does not route between them. All routed traffic must transit the firewall, where it is subject to the inter-zone policy defined above.
+
+This design has two important implications:
+
+1. **All inter-zone traffic is logged and inspectable.** Because it passes through the firewall, you can audit what is talking to what across zone boundaries.
+2. **Routing performance scales with the firewall's throughput**, not the switch's. For most home-lab and small enterprise deployments this is not a bottleneck, but it is a factor to consider if you expect high-bandwidth cross-zone flows (e.g., large storage migrations between a VM in the Trusted LAN and the Storage zone).
+
+---
+
+## DNS and Name Resolution
+
+Internal DNS is handled by a dedicated resolver running on `dns-01` (10.0.10.20). The resolver provides:
+
+- **Forward zones** for all internal hostnames under the `chip.internal` domain
+- **Reverse zones** for each subnet, enabling PTR lookups for all managed IPs
+- **Upstream forwarding** to a privacy-respecting public resolver (Cloudflare 1.1.1.1 with DNS-over-HTTPS) for external names
+- **Blocklist filtering** for known ad and tracking domains, applied to all zones except the Management zone
+
+<Note>
+  All managed hosts must use the internal DNS server as their primary resolver. Using a public DNS resolver directly from a managed host bypasses internal name resolution and may cause service discovery failures.
+</Note>
+
+---
+
+## Explore Network Sub-Topics
+
+<CardGroup cols={3}>
+  <Card title="VLANs" icon="table-columns" href="/network/vlans">
+    Full VLAN reference table with IDs, subnets, gateways, and per-VLAN configuration notes.
+  </Card>
+  <Card title="DNS" icon="globe" href="/network/dns">
+    Internal DNS zones, split-horizon configuration, blocklists, and resolver failover.
+  </Card>
+  <Card title="Firewall" icon="shield-halved" href="/network/firewall">
+    Inter-zone firewall ruleset, WAN policy, VPN configuration, and change procedures.
+  </Card>
+</CardGroup>

@@ -1,0 +1,176 @@
+---
+title: "CHIP Platform Architecture and Design Overview"
+sidebarTitle: "Architecture"
+description: "Explore CHIP's layered hybrid infrastructure architecture spanning network fabric, compute virtualization, containerized services, and observability."
+---
+
+CHIP (Chiodo Infrastructure Platform) is a hybrid infrastructure operations platform designed to unify the management of on-premises virtualization, containerized workloads, physical network fabric, and observability tooling under a single operational framework. Rather than treating each technology tier in isolation, CHIP models your infrastructure as a coherent stack of interdependent layers — each layer building on the contracts defined by the one beneath it. This document explains how those layers relate, what principles govern the platform's design, and how each major subsystem fits into the whole.
+
+## Design Principles
+
+Every architectural decision in CHIP traces back to three foundational principles that guide how the platform is built and operated.
+
+<CardGroup cols={3}>
+  <Card title="Single Source of Truth" icon="database">
+    All infrastructure state — hosts, roles, network assignments, service configurations — is declared in version-controlled files. No undocumented snowflakes, no configuration drift.
+  </Card>
+  <Card title="GitOps Documentation" icon="code-branch">
+    Changes to the platform are proposed, reviewed, and merged through a Git-based workflow. The repository history is the audit log.
+  </Card>
+  <Card title="Hybrid-Ready Design" icon="cloud">
+    CHIP is built to span on-premises bare-metal and hypervisor nodes alongside cloud-hosted services, treating both as first-class citizens in the same inventory and observability plane.
+  </Card>
+</CardGroup>
+
+These principles mean that if a configuration exists in production but is not reflected in the repository, it is considered unmanaged and subject to remediation. The platform does not tolerate silent divergence between declared state and observed state.
+
+---
+
+## Layered Architecture
+
+CHIP organizes your infrastructure into five discrete layers arranged in a dependency hierarchy. Higher layers consume services provided by lower layers; changes to a lower layer have known, bounded blast radii that can be reasoned about before they are applied.
+
+| Layer | Name | Responsibility |
+|-------|------|----------------|
+| **L1** | Network Fabric | Physical and logical connectivity — switches, VLANs, uplinks, WAN boundary |
+| **L2** | Compute Virtualization | Hypervisor clusters, VM lifecycle, resource pools (Proxmox VE) |
+| **L3** | Container Services | Dockerized application workloads, Compose stacks, service meshes |
+| **L4** | Platform Services | DNS, DHCP, NTP, secrets management, certificate authority |
+| **L5** | Observability | Metrics collection, log aggregation, alerting, dashboards |
+
+Thinking about your infrastructure in these terms gives you a structured way to answer the question "what breaks if X changes?" — and to document that answer before the change is made.
+
+---
+
+## Layer Breakdown
+
+### L1 — Network Fabric
+
+The network fabric is the foundation everything else depends on. CHIP documents the physical topology (switch models, port assignments, uplink cables) alongside the logical topology (VLANs, subnets, routing policy). All managed switches are configured with a consistent VLAN schema, and inter-VLAN routing is handled at a defined routing boundary rather than distributed across devices.
+
+For full details, see the [Network Overview](/network/overview) and [VLANs](/network/vlans) pages.
+
+### L2 — Compute Virtualization
+
+CHIP uses **Proxmox VE** as its primary hypervisor platform. Proxmox is deployed on one or more bare-metal nodes and provides the compute substrate for virtual machines and LXC containers. Each hypervisor node is registered in the CHIP inventory with its hardware specification, VLAN trunk configuration, and storage pool assignments.
+
+Key Proxmox concepts managed by CHIP:
+
+- **Nodes** — Individual hypervisor hosts joined to a Proxmox cluster
+- **Resource Pools** — Logical groupings of VMs and containers by environment or team
+- **Storage Pools** — Backed by local ZFS, Ceph, or NFS — defined per node in inventory
+- **VM Templates** — Golden images version-controlled alongside infrastructure code
+
+<Note>
+  Proxmox clusters expose a unified web UI and API across all nodes. CHIP treats the Proxmox API as a read/validate plane — authoritative configuration still lives in the repository.
+</Note>
+
+### L3 — Container Services
+
+Above the hypervisor layer, CHIP runs workloads as Docker containers orchestrated with **Docker Compose**. Each service stack lives in its own directory within the repository, with a `compose.yml` that declares the containers, volumes, networks, and environment variables that make up that service.
+
+Container workloads run on designated VM hosts (rather than directly on hypervisors) to maintain a clean separation between the virtualization control plane and the application data plane. This means a misbehaving container cannot directly affect the Proxmox node it ultimately runs on.
+
+### L4 — Platform Services
+
+Platform services are the shared infrastructure utilities that all other workloads depend on:
+
+- **DNS** — Internal resolution via AdGuard Home or Technitium DNS, with split-horizon zones for internal vs. external names
+- **DHCP** — Managed DHCP scopes aligned to VLAN subnets, with static reservations for all managed nodes
+- **NTP** — Authoritative time source for all cluster nodes
+- **Secrets Management** — Credentials and API keys stored in a self-hosted Vault instance, injected at deploy time rather than committed to the repository
+- **Internal CA** — A private certificate authority issues TLS certificates for internal services, eliminating browser warnings without exposing services to public CAs
+
+### L5 — Observability
+
+The observability layer gives you real-time and historical visibility into the health of every other layer. CHIP's default observability stack consists of:
+
+- **Prometheus** — Scrapes metrics from node exporters, cAdvisor, and application endpoints
+- **Loki** — Aggregates logs forwarded from systemd-journald, Docker log drivers, and syslog sources
+- **Grafana** — Unified dashboard and alerting UI consuming both Prometheus and Loki data sources
+- **Alertmanager** — Routes firing alerts to notification channels (email, Slack, PagerDuty)
+
+<Tip>
+  Deploy the observability stack early — ideally before you have more than two or three managed nodes. Retrofitting metrics collection onto an existing fleet is significantly more work than building it into the baseline.
+</Tip>
+
+---
+
+## Security Perimeter
+
+Security in CHIP is not a single component but a cross-cutting concern applied at each layer:
+
+<Accordion title="Network Security">
+  VLAN segmentation enforces zone isolation at the switching layer. A dedicated firewall (pfSense or OPNsense) sits at the WAN/LAN boundary and enforces inter-VLAN routing policy. The DMZ zone is air-gapped from the trusted LAN by default — explicit firewall rules are required to permit any traffic between them.
+</Accordion>
+
+<Accordion title="Host Security">
+  All managed hosts run a minimal OS footprint. SSH access is key-only; password authentication is disabled. Host-based firewalls (nftables or UFW) enforce a default-deny inbound policy, with explicit rules opened only for documented services. OS-level audit logging ships to Loki via the observability pipeline.
+</Accordion>
+
+<Accordion title="Service Security">
+  Containerized services run as non-root users wherever possible. Secrets are injected via environment variables sourced from Vault rather than stored in Compose files. Internal services are accessible only over HTTPS using certificates from the internal CA. External-facing services sit behind a reverse proxy (Traefik or Nginx Proxy Manager) that terminates TLS and enforces rate limiting.
+</Accordion>
+
+<Accordion title="Identity and Access">
+  Administrative access to the Proxmox cluster, network devices, and platform services is gated through a shared identity provider where feasible. API tokens are scoped to the minimum required permissions and rotated on a defined schedule. All privileged actions are logged to the observability stack.
+</Accordion>
+
+---
+
+## Component Relationships
+
+The following diagram shows how the major CHIP subsystems relate to one another and to the external world:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        CHIP Platform                        │
+│                                                             │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────┐ │
+│  │  Observabil-│    │  Platform   │    │   Container     │ │
+│  │  ity Stack  │◄───│  Services   │◄───│   Services      │ │
+│  │  (L5)       │    │  (L4)       │    │   (L3)          │ │
+│  └──────┬──────┘    └──────┬──────┘    └────────┬────────┘ │
+│         │                  │                    │           │
+│         └──────────────────▼────────────────────┘           │
+│                    ┌───────────────┐                        │
+│                    │   Compute     │                        │
+│                    │ Virtualization│                        │
+│                    │   (L2)        │                        │
+│                    └───────┬───────┘                        │
+│                            │                               │
+│                    ┌───────▼───────┐                        │
+│                    │    Network    │                        │
+│                    │    Fabric     │                        │
+│                    │    (L1)       │                        │
+│                    └───────┬───────┘                        │
+└────────────────────────────┼────────────────────────────────┘
+                             │
+                    ┌────────▼────────┐
+                    │   Internet /    │
+                    │   WAN / Cloud   │
+                    └─────────────────┘
+```
+
+<Info>
+  Arrows represent dependency direction — a higher layer depends on the layer it points toward. When you plan maintenance windows, work bottom-up to avoid cascading impact.
+</Info>
+
+---
+
+## Explore the Platform
+
+<CardGroup cols={2}>
+  <Card title="Infrastructure Inventory" icon="list-check" href="/platform/inventory">
+    Browse the authoritative record of all managed hosts, roles, and environments in the platform.
+  </Card>
+  <Card title="Network Overview" icon="network-wired" href="/network/overview">
+    Understand the physical and logical network topology, zones, and routing boundaries.
+  </Card>
+  <Card title="VLAN Reference" icon="table-columns" href="/network/vlans">
+    Look up VLAN IDs, subnets, gateways, and per-zone access policies.
+  </Card>
+  <Card title="Observability" icon="chart-line" href="/observability/monitoring">
+    Learn how metrics, logs, and alerts are collected and surfaced across the platform.
+  </Card>
+</CardGroup>

@@ -1,0 +1,192 @@
+---
+title: "TLS Certificate Management and Internal CA in CHIP"
+sidebarTitle: "Certificates"
+description: "Manage TLS certificates in CHIP using cert-manager, the internal CA, and Let's Encrypt ACME. Learn issuance, renewal, inventory tracking, and trust distribution."
+---
+
+CHIP enforces TLS encryption on every internal and external connection, which means certificate lifecycle management is a critical operational function. Certificates that expire unnoticed cause outages; certificates issued with weak configurations create security vulnerabilities. To eliminate both risks, CHIP automates certificate issuance and renewal through [cert-manager](https://cert-manager.io/) running inside the platform's Kubernetes control cluster, backed by two certificate authorities: the CHIP internal CA (for service-to-service and management plane certificates) and Let's Encrypt (for publicly trusted certificates on internet-facing endpoints). This page explains each certificate type, how the automation works, how to handle edge cases that require manual intervention, and how trust is distributed across the platform.
+
+## Certificate Authorities and Issuers
+
+CHIP uses three certificate issuers depending on the use case:
+
+| Issuer | Type | Trust | Used For |
+|---|---|---|---|
+| **CHIP Internal CA** | Private CA (intermediate, RSA 4096) | CHIP-managed hosts and services (distributed via config management) | Service-to-service mTLS, management plane endpoints (Grafana, Alertmanager, Loki, CHIP API) |
+| **Let's Encrypt (ACME)** | Public CA, DV | Publicly trusted (all browsers and OS trust stores) | Internet-facing user endpoints, external API endpoints |
+| **Intermediate Wildcard CA** | Private CA signed by internal root | CHIP-managed trust stores | Wildcard certs for internal subdomains where per-service certs are impractical |
+
+The CHIP internal CA root certificate is distributed to all CHIP-managed hosts via the configuration management layer (added to the system trust store), to Kubernetes nodes (mounted as a ConfigMap), and to application containers via an init container sidecar. This means any service running on CHIP infrastructure will automatically trust certificates issued by the internal CA without additional configuration.
+
+## Certificate Types and Inventory
+
+<Warning>
+Certificate expiry is a leading cause of unplanned downtime. Even with automation in place, you should monitor the `CertificateExpiryWarning` (< 30 days) and `CertificateExpiryCritical` (< 7 days) alerts in CHIP's alerting system. If you receive a critical expiry alert, treat it as an urgent operational issue and begin the manual renewal process immediately. Do not assume the automation will resolve it without investigation.
+</Warning>
+
+The following table is the canonical certificate inventory for CHIP-managed services. Update this table whenever you issue or retire a certificate by submitting a pull request to the `chip-config` repository.
+
+| Domain / Service | Issuer | Validity | Auto-Renew | Storage Location |
+|---|---|---|---|---|
+| `*.chip.example.com` | CHIP Internal CA | 90 days | ✅ cert-manager | Kubernetes Secret `cert-wildcard-internal` |
+| `grafana.chip.example.com` | Let's Encrypt | 90 days | ✅ ACME HTTP-01 | Kubernetes Secret `cert-grafana` |
+| `alertmanager.chip.example.com` | CHIP Internal CA | 90 days | ✅ cert-manager | Kubernetes Secret `cert-alertmanager` |
+| `loki.chip.example.com` | CHIP Internal CA | 90 days | ✅ cert-manager | Kubernetes Secret `cert-loki` |
+| `api.chip.example.com` | Let's Encrypt | 90 days | ✅ ACME DNS-01 | Kubernetes Secret `cert-api-public` |
+| `vault.internal` | CHIP Internal CA | 30 days | ✅ cert-manager | Kubernetes Secret `cert-vault` |
+| Service mTLS certs | CHIP Internal CA | 24 hours | ✅ cert-manager (auto-rotate) | Kubernetes Secret per-service |
+| Bastion host SSH TLS | CHIP Internal CA | 365 days | ✅ cert-manager | `/etc/chip/tls/bastion/` on host |
+| WireGuard VPN gateway | CHIP Internal CA | 365 days | ✅ cert-manager | `/etc/chip/tls/vpn/` on host |
+| External load balancer | Let's Encrypt | 90 days | ✅ ACME HTTP-01 | Load balancer ACM / secret |
+
+## How cert-manager Automates Renewal
+
+cert-manager watches `Certificate` custom resources in Kubernetes. When a certificate is within its **renewal window** (by default, 2/3 of the way through its validity period), cert-manager automatically requests a new certificate from the configured issuer and updates the Kubernetes Secret. Applications that mount the Secret as a volume or use the cert-manager `csi-driver` receive the new certificate without a restart in most cases. For applications that cache TLS certificates in memory, a rolling restart is triggered automatically by the CHIP deployment controller after cert-manager updates the Secret.
+
+```yaml
+# Example cert-manager Certificate resource (internal CA)
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: api-gateway-tls
+  namespace: production
+spec:
+  secretName: api-gateway-tls-secret
+  duration: 2160h        # 90 days
+  renewBefore: 720h      # Renew 30 days before expiry
+  commonName: api-gateway.production.svc.cluster.local
+  dnsNames:
+    - api-gateway.production.svc.cluster.local
+    - api.chip.example.com
+  issuerRef:
+    name: chip-internal-ca
+    kind: ClusterIssuer
+    group: cert-manager.io
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+```
+
+```yaml
+# Example cert-manager Certificate resource (Let's Encrypt)
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: grafana-public-tls
+  namespace: monitoring
+spec:
+  secretName: grafana-public-tls-secret
+  duration: 2160h
+  renewBefore: 720h
+  commonName: grafana.chip.example.com
+  dnsNames:
+    - grafana.chip.example.com
+  issuerRef:
+    name: letsencrypt-production
+    kind: ClusterIssuer
+    group: cert-manager.io
+```
+
+## Manually Renewing a Certificate
+
+In most cases, cert-manager handles renewal without any manual intervention. However, if an automated renewal fails (for example, due to an ACME challenge failure, a DNS misconfiguration, or an internal CA unavailability), you must intervene manually.
+
+<Steps>
+  <Step title="Identify the failing certificate">
+    Check the cert-manager logs and the `CertificateExpiryWarning` or `CertificateExpiryCritical` alerts to identify which certificate needs attention. You can also list all certificates and their status with:
+
+    ```bash
+    kubectl get certificates --all-namespaces
+    # Look for Ready=False or certificates with a short expiry in the AGE column
+    ```
+  </Step>
+  <Step title="Inspect the Certificate resource and associated request">
+    Describe the `Certificate` resource to see the last renewal attempt and any error messages:
+
+    ```bash
+    kubectl describe certificate <cert-name> -n <namespace>
+    # Look at the "Events" section for renewal errors
+
+    kubectl get certificaterequests -n <namespace>
+    kubectl describe certificaterequest <request-name> -n <namespace>
+    ```
+  </Step>
+  <Step title="Resolve the underlying issue">
+    Common causes and remediation:
+
+    | Error | Likely Cause | Remediation |
+    |---|---|---|
+    | ACME HTTP-01 challenge failure | Load balancer not routing `.well-known/acme-challenge` | Verify ingress rules; check WAF is not blocking the path |
+    | ACME DNS-01 challenge failure | DNS API credentials stale or DNS propagation delay | Rotate DNS provider credentials in Vault; wait for propagation |
+    | Internal CA unreachable | CHIP CA pod not running | Check `cert-manager` namespace pod health; restart if necessary |
+    | Certificate resource misconfigured | Wrong issuer name or DNS SANs | Edit the `Certificate` resource YAML to correct the configuration |
+  </Step>
+  <Step title="Trigger a manual renewal">
+    Once the underlying issue is resolved, delete the existing `CertificateRequest` to force cert-manager to issue a new one:
+
+    ```bash
+    # Delete the stale CertificateRequest — cert-manager will create a new one
+    kubectl delete certificaterequest <request-name> -n <namespace>
+
+    # Monitor the new request
+    kubectl get certificaterequests -n <namespace> -w
+    ```
+
+    Alternatively, annotate the Certificate resource to trigger an immediate re-issuance:
+
+    ```bash
+    kubectl annotate certificate <cert-name> -n <namespace> \
+      cert-manager.io/issue-temporary-certificate="true" --overwrite
+    ```
+  </Step>
+  <Step title="Verify the new certificate is deployed">
+    Once the `Certificate` resource shows `Ready=True`, verify that the Kubernetes Secret has been updated and that the service is serving the new certificate:
+
+    ```bash
+    # Check the secret was updated (look at the "tls.crt" key's certificate dates)
+    kubectl get secret <secret-name> -n <namespace> -o jsonpath='{.data.tls\.crt}' \
+      | base64 -d | openssl x509 -noout -dates
+
+    # Verify the live endpoint is serving the new cert
+    echo | openssl s_client -connect <service-hostname>:443 2>/dev/null \
+      | openssl x509 -noout -dates
+    ```
+  </Step>
+  <Step title="Document and investigate">
+    If the automated renewal failed, open a post-incident review to identify why automation did not handle it and prevent recurrence. Update this runbook if the resolution involved a previously undocumented edge case.
+  </Step>
+</Steps>
+
+## Issuing Certificates for New Services
+
+When you deploy a new service that needs TLS, follow these steps to ensure it is issued a certificate from the correct authority:
+
+1. **Determine the issuer** — Internet-facing endpoints use `letsencrypt-production`; internal services use `chip-internal-ca`.
+2. **Create a `Certificate` resource** in the service's Kubernetes namespace using one of the example templates above. Ensure `dnsNames` includes every hostname the service will be accessed on.
+3. **Reference the Secret in your service's deployment** — Mount the Secret as a volume or use the `cert-manager` CSI driver to inject it directly.
+4. **Verify issuance** — Within 2–5 minutes for internal CA certificates and up to 2 minutes for Let's Encrypt (assuming DNS is already configured), the `Certificate` resource should show `Ready=True`.
+
+For non-Kubernetes services (bare-metal hosts or VMs), certificates are requested via the CHIP control plane under **Security → Certificates → Request Certificate**. The control plane generates the CSR, signs it against the internal CA, and deploys the certificate to the target host via the configuration management layer.
+
+## Internal CA Trust Distribution
+
+The CHIP internal CA root certificate is distributed to:
+
+- **Linux hosts** — Added to `/etc/ca-certificates/trust-source/anchors/` and the system trust store via `update-ca-trust` / `update-ca-certificates` in the base image
+- **Kubernetes nodes** — Mounted as a `ConfigMap` in the `kube-system` namespace and referenced in the kubelet configuration
+- **Application containers** — Injected via the `chip-ca-trust` init container that prepends the CHIP CA to the container's trust store at startup
+- **Operator workstations** — The CA certificate is included in the CHIP onboarding documentation; operators must install it in their OS and browser trust stores as part of initial setup
+
+```bash
+# Install the CHIP internal CA on a Linux workstation
+sudo cp chip-internal-ca.pem /usr/local/share/ca-certificates/chip-internal-ca.crt
+sudo update-ca-certificates
+
+# Verify the CA is trusted
+openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt \
+  <path-to-a-chip-internal-cert.pem>
+```
+
+<Tip>
+You can download the current CHIP internal CA certificate from the CHIP control plane at **Security → Certificates → Download CA Bundle**. The bundle includes the root and any active intermediate certificates. Use this bundle when configuring tools like `curl`, `httpie`, or database clients that use their own trust store rather than the OS store.
+</Tip>

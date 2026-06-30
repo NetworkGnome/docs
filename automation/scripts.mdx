@@ -1,0 +1,265 @@
+---
+title: "Automation Scripts: Standards, Library & Cron Jobs"
+sidebarTitle: "Scripts"
+description: "Browse CHIP's utility script library, learn scripting standards and conventions, and find out how to add new scripts or manage scheduled cron tasks."
+---
+
+CHIP maintains a library of utility scripts for tasks that are too focused or interactive to warrant a full Ansible playbook. These scripts handle host-local maintenance, diagnostic routines, one-shot data migrations, and operational utilities that engineers run directly. Like all automation in CHIP, scripts are version-controlled, reviewed, and held to consistent standards — a script that only one person understands and only works on one engineer's machine is a liability, not an asset.
+
+## Script Locations
+
+Scripts are organized by language and purpose under `automation/scripts/`:
+
+```
+automation/scripts/
+├── bash/
+│   ├── backup-snapshot.sh       # Trigger and verify a Proxmox snapshot backup
+│   ├── cert-check.sh            # Check TLS certificate expiry across all services
+│   ├── cleanup-docker.sh        # Remove dangling images, volumes, and stopped containers
+│   ├── disk-usage-report.sh     # Generate a disk usage summary for all monitored hosts
+│   ├── rotate-logs.sh           # Force log rotation and archive old logs to object storage
+│   └── service-healthcheck.sh   # Ping all registered services and report status
+├── python/
+│   ├── dns-audit.py             # Audit DNS records against the infrastructure inventory
+│   ├── vm-inventory-export.py   # Export Proxmox VM inventory to JSON/CSV
+│   ├── alert-summary.py         # Fetch and summarize active Alertmanager alerts
+│   └── cost-report.py           # Generate monthly resource utilization report
+└── templates/
+    ├── script-template.sh       # Canonical Bash script template
+    └── script-template.py       # Canonical Python script template
+```
+
+## Language Standards
+
+Choosing the right scripting language keeps the codebase consistent and maintainable:
+
+- **Bash** — Use for system-level tasks, file manipulation, process management, and anything that primarily shells out to system utilities. Bash scripts must be compatible with `bash 4.x` and should not rely on non-standard tools unless those tools are declared as dependencies in the script header.
+- **Python** — Use for tasks that involve complex logic, data structures, API calls, JSON/YAML parsing, or anything that would require more than 50 lines of readable Bash. Python scripts target Python 3.10+ and use only the standard library unless a `requirements.txt` is provided alongside the script.
+
+<Note>
+Do not mix languages within a single script. If a Bash script is growing a Python-style data processing loop, that is a signal to rewrite it in Python. Hybrid scripts are fragile and hard to test.
+</Note>
+
+## Script Reference
+
+| Script | Language | Purpose | Usage Example |
+|---|---|---|---|
+| `backup-snapshot.sh` | Bash | Trigger a Proxmox snapshot and verify completion | `./backup-snapshot.sh --vmid 102 --name pre-upgrade` |
+| `cert-check.sh` | Bash | Report TLS certificate expiry for all services | `./cert-check.sh --warn-days 30` |
+| `cleanup-docker.sh` | Bash | Remove unused Docker resources on the local host | `./cleanup-docker.sh --dry-run` |
+| `disk-usage-report.sh` | Bash | Print disk usage summary with threshold warnings | `./disk-usage-report.sh --threshold 80` |
+| `rotate-logs.sh` | Bash | Force log rotation and archive to object storage | `./rotate-logs.sh --archive-bucket s3://chip-logs` |
+| `service-healthcheck.sh` | Bash | Check HTTP/TCP health for all registered services | `./service-healthcheck.sh --env production` |
+| `dns-audit.py` | Python | Compare DNS records to expected infrastructure state | `python dns-audit.py --zone chip.internal --report` |
+| `vm-inventory-export.py` | Python | Export Proxmox VM list to JSON or CSV | `python vm-inventory-export.py --format json --out vms.json` |
+| `alert-summary.py` | Python | Summarize active alerts from Alertmanager API | `python alert-summary.py --url http://alertmanager:9093` |
+| `cost-report.py` | Python | Generate monthly resource utilization summary | `python cost-report.py --month 2024-11 --output report.csv` |
+
+## Example Script Invocations
+
+```bash
+# Check certificates expiring within the next 14 days
+./automation/scripts/bash/cert-check.sh --warn-days 14
+
+# Dry-run Docker cleanup to preview what would be removed
+./automation/scripts/bash/cleanup-docker.sh --dry-run
+
+# Run a service health check against the production environment
+./automation/scripts/bash/service-healthcheck.sh --env production
+
+# Export the current VM inventory to a JSON file
+python automation/scripts/python/vm-inventory-export.py \
+  --format json \
+  --out /tmp/vm-inventory-$(date +%Y%m%d).json
+
+# Audit DNS records and write a discrepancy report
+python automation/scripts/python/dns-audit.py \
+  --zone chip.internal \
+  --report \
+  --output /tmp/dns-audit-report.txt
+```
+
+## Scripting Conventions
+
+All scripts in the CHIP library follow these conventions. Pull requests that do not meet these standards will not be merged.
+
+### Bash Conventions
+
+Every Bash script must begin with a standard header block and enable strict mode:
+
+```bash
+#!/usr/bin/env bash
+# =============================================================================
+# Script Name:  cleanup-docker.sh
+# Description:  Remove unused Docker images, volumes, and stopped containers.
+#               Safe to run on any Docker host. Supports --dry-run mode.
+# Usage:        ./cleanup-docker.sh [--dry-run] [--verbose]
+# Dependencies: docker
+# Author:       Platform Team
+# Last Updated: 2024-11-01
+# =============================================================================
+
+set -euo pipefail
+
+# --- Constants ---------------------------------------------------------------
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly LOG_FILE="/var/log/chip/${SCRIPT_NAME%.sh}.log"
+
+# --- Defaults ----------------------------------------------------------------
+DRY_RUN=false
+VERBOSE=false
+
+# --- Logging -----------------------------------------------------------------
+log() {
+  local level="$1"; shift
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] $*" | tee -a "${LOG_FILE}"
+}
+
+info()  { log "INFO " "$@"; }
+warn()  { log "WARN " "$@"; }
+error() { log "ERROR" "$@"; exit 1; }
+
+# --- Argument Parsing --------------------------------------------------------
+usage() {
+  echo "Usage: ${SCRIPT_NAME} [--dry-run] [--verbose]"
+  echo ""
+  echo "Options:"
+  echo "  --dry-run    Show what would be removed without making changes"
+  echo "  --verbose    Enable verbose output"
+  echo "  --help       Show this help message"
+  exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)  DRY_RUN=true ;;
+    --verbose)  VERBOSE=true ;;
+    --help|-h)  usage ;;
+    *) error "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+# --- Idempotency Check -------------------------------------------------------
+if ! command -v docker &>/dev/null; then
+  error "docker is not installed or not in PATH"
+fi
+
+# --- Main Logic --------------------------------------------------------------
+main() {
+  info "Starting Docker cleanup on $(hostname)"
+
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    info "DRY RUN mode: no changes will be made"
+    docker system df
+    return 0
+  fi
+
+  info "Removing stopped containers..."
+  docker container prune --force
+
+  info "Removing dangling images..."
+  docker image prune --force
+
+  info "Removing unused volumes..."
+  docker volume prune --force
+
+  info "Docker cleanup complete."
+}
+
+main "$@"
+```
+
+### Key Conventions Explained
+
+- **`set -euo pipefail`** — Exit immediately on error (`-e`), treat unset variables as errors (`-u`), and propagate pipe failures (`-o pipefail`). This is non-negotiable in all Bash scripts.
+- **Logging to file and stdout** — Every significant action is logged with a timestamp. Logs go to `/var/log/chip/` on the local host.
+- **`--dry-run` support** — Any script that makes changes to the system must support a `--dry-run` flag that previews changes without applying them.
+- **Idempotency checks** — Scripts check preconditions before acting and skip steps that are already complete.
+- **`readonly` for constants** — Values that should not change during execution are declared `readonly`.
+
+## Adding a New Script to the Automation Library
+
+<Steps>
+  <Step title="Copy the appropriate template">
+    Start from the canonical template in `automation/scripts/templates/` rather than from scratch. This ensures the header, logging, and argument parsing scaffolding is in place from the beginning.
+
+    ```bash
+    cp automation/scripts/templates/script-template.sh \
+       automation/scripts/bash/my-new-script.sh
+    chmod +x automation/scripts/bash/my-new-script.sh
+    ```
+  </Step>
+  <Step title="Fill in the header block">
+    Update the script name, description, usage, and dependencies in the header comment block. These fields are read by the documentation generator — keep them accurate.
+  </Step>
+  <Step title="Implement the script logic">
+    Write the script body following the conventions above. Every action that modifies system state must be wrapped in an `if [[ "${DRY_RUN}" == "false" ]]` guard.
+  </Step>
+  <Step title="Test in a non-production environment">
+    Run the script against a dev or staging host first. Run with `--dry-run` first, then with `--verbose` to confirm logging behavior, then with a live run to validate the actual outcome.
+
+    ```bash
+    ssh dev-host01 'bash -s' < automation/scripts/bash/my-new-script.sh --dry-run
+    ```
+  </Step>
+  <Step title="Add an entry to the script reference table">
+    Update the script reference table in this page and in the inline `README.md` in `automation/scripts/`. Include the script name, language, purpose, and a usage example.
+  </Step>
+  <Step title="Open a pull request">
+    Commit your script and the documentation update together. The PR description should explain what the script does, when to use it, and what it modifies.
+
+    ```bash
+    git add automation/scripts/bash/my-new-script.sh
+    git commit -m "scripts: add my-new-script for [purpose]"
+    git push origin feature/my-new-script
+    ```
+  </Step>
+</Steps>
+
+## Cron Job Management
+
+Scheduled tasks in CHIP are managed through Ansible, not by manually editing crontabs on individual hosts. This ensures every scheduled task is version-controlled, consistently deployed, and visible to the whole team.
+
+### Where Cron Jobs Are Defined
+
+Cron jobs are defined in the `tasks/cron.yml` file of the relevant Ansible role. For example, the `backup` role defines all backup-related cron tasks:
+
+```yaml
+# roles/backup/tasks/cron.yml
+- name: Schedule nightly VM snapshot backup
+  ansible.builtin.cron:
+    name: "chip-backup-nightly"
+    user: root
+    minute: "0"
+    hour: "2"
+    job: "/opt/chip/scripts/backup-snapshot.sh --all >> /var/log/chip/backup.log 2>&1"
+    state: present
+
+- name: Schedule weekly log archive
+  ansible.builtin.cron:
+    name: "chip-log-archive-weekly"
+    user: root
+    weekday: "0"
+    hour: "3"
+    minute: "30"
+    job: "/opt/chip/scripts/rotate-logs.sh --archive-bucket s3://chip-logs >> /var/log/chip/rotate-logs.log 2>&1"
+    state: present
+```
+
+### Adding a Scheduled Task
+
+1. Identify which Ansible role owns the script that needs scheduling.
+2. Add a `cron` task to that role's `tasks/cron.yml`.
+3. Use the `name` field as a unique identifier — Ansible uses it to manage the crontab entry idempotently.
+4. Always redirect both stdout and stderr to a log file so cron output is auditable.
+5. Deploy the updated role via the appropriate playbook.
+
+```bash
+# Deploy updated cron configuration to all storage nodes
+ansible-playbook -i inventory/production playbooks/backup-config.yml --tags cron
+```
+
+<Tip>
+Use a descriptive `name` field in every `ansible.builtin.cron` task. Ansible uses this name as the crontab comment, making it easy to identify CHIP-managed cron jobs when reviewing a host's crontab manually.
+</Tip>

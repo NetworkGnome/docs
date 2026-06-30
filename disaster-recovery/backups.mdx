@@ -1,0 +1,205 @@
+---
+title: "Backup Architecture and Job Reference for CHIP"
+sidebarTitle: "Backups"
+description: "Complete reference for CHIP's backup architecture, job schedules, retention policies, offsite replication, encryption, and backup health monitoring."
+---
+
+Reliable backups are the foundation of every disaster recovery capability. In CHIP, backups are automated, encrypted, monitored, and replicated offsite — but automated backups are only trustworthy if they are regularly verified. This page documents what is backed up, how it is backed up, where backup data is stored, and how you confirm that backups are completing as expected. Use this reference alongside the [Restoration runbook](/disaster-recovery/restoration) when recovering from an incident.
+
+<Warning>
+  Never delete a backup without first verifying that a restore from that backup completes successfully. Even a backup that looks healthy may contain corrupted data that is only discovered at restore time. If you need to free storage space, contact Platform Ops before removing any backup set.
+</Warning>
+
+---
+
+## Backup Architecture Overview
+
+CHIP uses a layered backup architecture that covers three distinct data domains: virtual machine disk images and container filesystems managed by Proxmox, Docker volume data for containerized workloads, and configuration files and secrets for infrastructure components.
+
+### Proxmox Backup Server (PBS)
+
+Proxmox VMs and LXC containers are backed up using Proxmox Backup Server, deployed as a dedicated appliance within the CHIP environment. PBS uses a client-pull model: the PBS server connects to each Proxmox node on schedule and streams deduplicated, encrypted backups directly to its datastore.
+
+Key PBS characteristics in the CHIP environment:
+
+- **Deduplication:** Block-level deduplication reduces storage consumption significantly for similar workloads and incremental snapshots.
+- **Encryption:** All backups are encrypted client-side using AES-256 before transmission to PBS. Encryption keys are stored in CHIP Secrets, not on the PBS appliance.
+- **Verify jobs:** PBS runs automated verification tasks to check the integrity of backup chunks after every backup job.
+- **Backup datastore:** Local NVMe-backed datastore on the PBS appliance for fast restoration, with offsite replication configured (see below).
+
+### Docker Volume Backups
+
+Docker volumes containing persistent application data (databases, user uploads, message queue data) are backed up using a combination of methods depending on the volume type:
+
+- **Named volumes** are backed up using the `chip-backup-agent` container, which snapshots the volume, compresses it with zstd, and uploads it to the configured object storage.
+- **Database volumes** use database-native dump methods (pg_dump for PostgreSQL, mysqldump for MySQL) rather than raw volume snapshots to ensure backup consistency.
+- **Bind-mounted host paths** are backed up via the OS-level file backup agent (Restic) running on the Docker host.
+
+### Configuration File Backups
+
+Infrastructure configuration files — including Proxmox node configs, Docker daemon settings, CHIP platform configs, network device configurations, and Ansible/Terraform state — are backed up using Restic to the CHIP object storage bucket. These are lightweight but critical: losing configuration state can be more damaging than losing application data.
+
+---
+
+## Backup Jobs Reference
+
+The following table lists all configured backup jobs in the CHIP environment.
+
+| Job Name | Target | Schedule | Retention | Storage Location | Method |
+|---|---|---|---|---|---|
+| pbs-tier1-vms | All Tier 1 VMs | Every 4 hours | 7 daily, 4 weekly | PBS Datastore (local) | PBS client backup |
+| pbs-tier2-vms | All Tier 2 VMs | Daily at 01:00 | 7 daily, 4 weekly | PBS Datastore (local) | PBS client backup |
+| pbs-tier3-vms | All Tier 3 VMs | Daily at 02:00 | 3 daily, 2 weekly | PBS Datastore (local) | PBS client backup |
+| pbs-lxc-containers | All LXC containers | Daily at 01:30 | 7 daily, 4 weekly | PBS Datastore (local) | PBS client backup |
+| docker-volume-databases | PostgreSQL, MySQL volumes | Every 6 hours | 7 daily, 4 weekly | S3-compatible object store | pg_dump / mysqldump |
+| docker-volume-app-data | All named Docker volumes | Daily at 03:00 | 7 daily, 2 weekly | S3-compatible object store | chip-backup-agent |
+| host-configs | All infrastructure config dirs | Every 12 hours | 14 daily | S3-compatible object store | Restic |
+| pbs-offsite-sync | PBS Datastore → offsite | Daily at 05:00 | Same as source | Offsite PBS replica | PBS sync job |
+| restic-offsite-sync | Object store → offsite | Daily at 06:00 | Same as source | Offsite S3 bucket | S3 replication |
+| secrets-backup | CHIP Secrets vault | Daily at 00:30 | 30 daily | Encrypted offsite store | Vault export |
+
+---
+
+## Offsite and Remote Backup Replication
+
+Backups stored only in the primary datacenter are vulnerable to the same site failure scenarios they are meant to protect against. CHIP replicates all backup data to an offsite location using two separate replication paths.
+
+### PBS Offsite Sync
+
+PBS's built-in sync job replicates the full backup datastore to an offsite PBS instance nightly. The sync job transfers only new or modified chunks, making it efficient even for large datastores. To monitor sync status:
+
+```bash
+# On the primary PBS node
+proxmox-backup-client status
+# Check sync job logs in the PBS web UI: Administration → Sync Jobs
+```
+
+The offsite PBS instance is network-isolated from the primary environment. It is accessible only via a dedicated, monitored VPN connection activated during a DR event.
+
+### Object Storage Replication
+
+Docker volume and config file backups stored in the primary S3-compatible object store are replicated to an offsite S3 bucket using versioned replication. Object versioning is enabled on both the source and destination buckets, providing an additional layer of protection against accidental deletion.
+
+To verify replication is current:
+
+```bash
+chip backup status offsite --check-lag
+```
+
+A replication lag of more than 24 hours triggers an automatic alert in CHIP monitoring.
+
+---
+
+## Backup Encryption
+
+All backup data in CHIP is encrypted at rest and in transit.
+
+| Layer | Encryption Method | Key Storage |
+|---|---|---|
+| PBS VM/LXC backups | AES-256-GCM (client-side) | CHIP Secrets vault |
+| Docker volume backups | AES-256 (Restic encryption) | CHIP Secrets vault |
+| Object storage at rest | AES-256 (server-side) | Storage provider managed |
+| Offsite PBS | AES-256-GCM (same key as source) | CHIP Secrets vault |
+| Backup transmission | TLS 1.3 in transit | — |
+
+<Warning>
+  If the encryption keys stored in CHIP Secrets are lost, encrypted backups **cannot be recovered**, regardless of how many copies exist. Ensure that encryption keys are backed up separately in a geographically distributed, access-controlled key recovery store. Review the key backup procedure with your security team annually.
+</Warning>
+
+---
+
+## Verifying a Completed Backup
+
+Automated backup jobs report their status to CHIP monitoring, but you should periodically verify backups manually — especially before a maintenance window or after an infrastructure change that could affect backup connectivity.
+
+<Steps>
+  <Step title="Check the CHIP backup status dashboard">
+    Navigate to **Disaster Recovery → Backup Status** in the CHIP dashboard. Each job displays its last run time, duration, size transferred, and pass/fail status. Investigate any job that shows a warning or failure state.
+  </Step>
+  <Step title="Verify the PBS job completed for target VMs">
+    Log into the PBS web interface or use the CLI to confirm the backup job completed for your target VMs.
+
+    ```bash
+    # List recent backups for a specific VM
+    proxmox-backup-client snapshots \
+      --repository <pbs-user>@<pbs-host>:<datastore> \
+      vm/<vmid>
+
+    # Verify the integrity of the most recent snapshot
+    proxmox-backup-client verify \
+      --repository <pbs-user>@<pbs-host>:<datastore> \
+      vm/<vmid>/<snapshot-id>
+    ```
+
+    A successful verify output ends with `Verification successful`.
+  </Step>
+  <Step title="Check Docker volume backup jobs">
+    Confirm the Docker volume backup completed and the archive is readable.
+
+    ```bash
+    chip backup verify \
+      --job docker-volume-databases \
+      --latest
+    ```
+
+    This command pulls the latest archive, decrypts it, and performs a checksum verification without performing a full restore.
+  </Step>
+  <Step title="Confirm offsite replication is current">
+    Verify that the most recent local backup has been replicated offsite.
+
+    ```bash
+    chip backup status offsite --verbose
+    ```
+
+    The output shows the timestamp of the latest offsite backup. If it is older than the configured sync window, investigate the sync job logs.
+  </Step>
+  <Step title="Spot-check with a test restore">
+    Once per month (or after any infrastructure change affecting backup connectivity), perform a test restore to a non-production host to confirm the backup is restorable, not just syntactically valid.
+
+    ```bash
+    chip backup test-restore \
+      --job pbs-tier1-vms \
+      --vm <vmid> \
+      --target-node <dev-proxmox-node> \
+      --snapshot latest
+    ```
+
+    Verify the restored VM boots and the application starts successfully before deleting the test restore.
+  </Step>
+</Steps>
+
+---
+
+## Backup Monitoring and Alerting
+
+CHIP's monitoring stack watches backup jobs continuously and fires alerts when jobs fail, run long, or produce suspiciously small outputs.
+
+### Alert Conditions
+
+| Alert Name | Condition | Severity | Notification Channel |
+|---|---|---|---|
+| `backup_job_failed` | Any backup job exits with non-zero status | P2 | PagerDuty + Slack |
+| `backup_job_missed` | Backup job did not run within its scheduled window + 30 min | P2 | PagerDuty + Slack |
+| `backup_job_long_running` | Job runtime exceeds 2× average duration | P3 | Slack |
+| `backup_size_anomaly` | Backup size is less than 50% of the 7-day average | P2 | PagerDuty + Slack |
+| `offsite_replication_lag` | Offsite replication more than 24 hours behind | P2 | PagerDuty + Slack |
+| `pbs_datastore_space_warning` | PBS datastore above 80% capacity | P3 | Slack |
+| `pbs_datastore_space_critical` | PBS datastore above 90% capacity | P2 | PagerDuty + Slack |
+
+### Responding to Backup Alerts
+
+When a `backup_job_failed` or `backup_job_missed` alert fires:
+
+1. Check the job logs in the CHIP dashboard under **DR → Backup Jobs → [Job Name] → Recent Runs**.
+2. Common causes include: network connectivity between the Proxmox host and PBS, PBS datastore out of space, VM in a suspended state that PBS cannot snapshot, or expired/rotated PBS credentials.
+3. Resolve the root cause, then trigger a manual backup run for the affected job:
+
+```bash
+chip backup run --job <job-name> --target <vmid-or-host> --now
+```
+
+4. Confirm the manual run succeeds before acknowledging the alert.
+
+<Info>
+  CHIP's backup monitoring does not replace active human review. A backup that completes successfully but produces a corrupted archive will not trigger any alert. Monthly test restores are the only reliable mechanism for detecting silent backup failures.
+</Info>

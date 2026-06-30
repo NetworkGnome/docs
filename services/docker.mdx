@@ -1,0 +1,261 @@
+---
+title: "Docker Runtime Environment & Host Configuration"
+sidebarTitle: "Docker"
+description: "Docker daemon setup, host inventory, networking models, image management, and security practices for the CHIP infrastructure platform."
+---
+
+CHIP runs containerized workloads on a fleet of dedicated Docker hosts. Each host is provisioned with a pinned Docker Engine version, a standardized daemon configuration, and integrated into the platform's VLAN-aware network fabric. Understanding the Docker runtime layer helps you deploy services consistently, troubleshoot container networking, and maintain a secure container posture across all environments.
+
+## Docker Host Inventory
+
+Every host that participates in the Docker runtime is tracked in the CHIP inventory. The table below reflects the current registered hosts, their roles, and the Docker Engine version in use.
+
+| Hostname | IP Address | Environment | Docker Version | Role |
+|---|---|---|---|---|
+| `docker-prod-01` | `10.10.1.11` | Production | 26.1.4 | General workloads |
+| `docker-prod-02` | `10.10.1.12` | Production | 26.1.4 | General workloads |
+| `docker-media-01` | `10.10.2.21` | Production | 26.1.4 | Media services |
+| `docker-mon-01` | `10.10.3.31` | Production | 26.1.4 | Monitoring stack |
+| `docker-dev-01` | `10.10.9.91` | Development | 26.1.4 | Dev / testing |
+
+<Note>
+All production hosts are joined to their respective VLANs at the hypervisor level. Container traffic on `macvlan` networks exits through the VLAN interface of the host, giving containers first-class Layer 2 presence on the segment — no NAT required for LAN-reachable services.
+</Note>
+
+## Docker Daemon Configuration
+
+The daemon on every CHIP host is managed through `/etc/docker/daemon.json`. A canonical baseline configuration is applied during provisioning via the platform's Ansible role and looks like the following.
+
+```json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "20m",
+    "max-file": "5",
+    "compress": "true"
+  },
+  "storage-driver": "overlay2",
+  "default-address-pools": [
+    { "base": "172.20.0.0/16", "size": 24 }
+  ],
+  "live-restore": true,
+  "userland-proxy": false,
+  "no-new-privileges": true,
+  "metrics-addr": "0.0.0.0:9323",
+  "experimental": false
+}
+```
+
+Key decisions reflected in this configuration:
+
+- **`live-restore: true`** — containers continue running if the Docker daemon restarts, avoiding service interruptions during daemon upgrades.
+- **`userland-proxy: false`** — kernel-level `iptables` DNAT is used for port publishing instead of the `docker-proxy` process, reducing overhead and improving performance.
+- **`no-new-privileges: true`** — prevents any process inside a container from gaining additional Linux capabilities after start via `execve`.
+- **`metrics-addr`** — exposes Prometheus-format Docker Engine metrics on port `9323`, scraped by the platform monitoring stack.
+
+### Log Driver Configuration
+
+All containers use the `json-file` log driver with rotation enforced at 20 MB per file, retaining up to five compressed files. This caps log storage at approximately 100 MB per container while preserving recent history for `docker logs` access.
+
+For services that require centralized log aggregation, the Loki log driver or a sidecar Promtail container is used in addition to local JSON logging — not as a replacement — so local log access is never lost.
+
+## Docker Networking Model
+
+CHIP uses three Docker network types depending on service requirements.
+
+<CardGroup cols={3}>
+  <Card title="Bridge" icon="bridge">
+    Default internal network for stack-scoped communication. Services within the same Compose stack communicate over a dedicated bridge network. Not routable outside the host.
+  </Card>
+  <Card title="Macvlan" icon="network-wired">
+    Assigns a real MAC address from the host's VLAN segment to the container. Used for services that must appear as first-class LAN devices (e.g., DHCP, mDNS-sensitive apps).
+  </Card>
+  <Card title="Host" icon="server">
+    Shares the host's network namespace. Reserved for performance-sensitive or low-level services such as WireGuard, monitoring agents, and SNMP collectors.
+  </Card>
+</CardGroup>
+
+<Note>
+When using `macvlan`, the host interface and the macvlan containers cannot communicate directly due to the macvlan kernel driver's isolation. A `macvlan` bridge interface (`macvlan-shim`) is created on the host to re-enable host-to-container reachability for health checks and monitoring.
+</Note>
+
+## Image Management
+
+### Private Registry
+
+CHIP maintains an internal Harbor registry at `registry.chip.internal:5000`. All production images are mirrored or built internally before deployment — containers never pull from Docker Hub at runtime on production hosts.
+
+Registry namespaces follow this convention:
+
+| Namespace | Purpose |
+|---|---|
+| `registry.chip.internal/library/` | Mirrored public images (Docker Hub proxied) |
+| `registry.chip.internal/chip/` | Internally built CHIP platform images |
+| `registry.chip.internal/thirdparty/` | Vendor images from other registries (GHCR, Quay) |
+
+### Image Naming Convention
+
+```
+registry.chip.internal/<namespace>/<image-name>:<semver-tag>
+```
+
+Example:
+
+```
+registry.chip.internal/chip/config-watcher:1.4.2
+registry.chip.internal/library/nginx:1.27.0-alpine
+```
+
+Floating tags such as `latest` are forbidden in production Compose files. Every service definition must pin a specific version tag.
+
+### Volume Management
+
+Persistent data is managed through bind mounts to a standardized directory tree on the host, rather than anonymous Docker volumes. This makes backup, migration, and inspection straightforward.
+
+```
+/opt/chip/
+  stacks/          # Compose files live here
+  data/            # Persistent bind-mount data root
+    <stack-name>/
+      <service-name>/
+  config/          # Read-only configuration bind mounts
+    <stack-name>/
+  secrets/         # Secret files (mode 0400, root-owned)
+```
+
+Docker named volumes are used only for ephemeral scratch space (e.g., build caches) and are never backed up.
+
+## Deploying a Service on a Docker Host
+
+<Steps>
+  <Step title="SSH to the target host">
+    Connect to the Docker host where the service will run. All hosts are reachable via the bastion at `bastion.chip.internal`.
+
+    ```bash
+    ssh chip@docker-prod-01.chip.internal
+    ```
+  </Step>
+  <Step title="Create the stack directory">
+    Create the Compose project directory under `/opt/chip/stacks/` and the corresponding data directory.
+
+    ```bash
+    sudo mkdir -p /opt/chip/stacks/my-service
+    sudo mkdir -p /opt/chip/data/my-service
+    cd /opt/chip/stacks/my-service
+    ```
+  </Step>
+  <Step title="Write the Compose file">
+    Create `docker-compose.yml` with a pinned image tag, explicit resource limits, and a named bridge network. Use `restart: unless-stopped` for all production services.
+
+    ```yaml
+    services:
+      my-service:
+        image: registry.chip.internal/library/my-service:2.3.1
+        container_name: my-service
+        restart: unless-stopped
+        networks:
+          - my-service-net
+        volumes:
+          - /opt/chip/data/my-service:/data
+        environment:
+          - TZ=America/New_York
+        deploy:
+          resources:
+            limits:
+              cpus: "1.0"
+              memory: 512M
+
+    networks:
+      my-service-net:
+        driver: bridge
+    ```
+  </Step>
+  <Step title="Create the .env file">
+    Place any environment-specific overrides in `.env` alongside the Compose file. Never commit secrets directly into `docker-compose.yml`.
+
+    ```bash
+    sudo tee .env <<'EOF'
+    MY_SERVICE_SECRET_KEY=/run/secrets/my-service-key
+    LOG_LEVEL=info
+    EOF
+    ```
+  </Step>
+  <Step title="Pull images and start the stack">
+    Pull from the internal registry first, then bring the stack up.
+
+    ```bash
+    sudo docker compose pull
+    sudo docker compose up -d
+    ```
+  </Step>
+  <Step title="Verify container health">
+    Confirm the container started cleanly and passes its health check.
+
+    ```bash
+    sudo docker compose ps
+    sudo docker compose logs --tail=50 my-service
+    ```
+  </Step>
+</Steps>
+
+## Docker Security Practices
+
+Security hardening is applied at multiple layers: the daemon, the image build process, and the runtime container configuration.
+
+<Accordion title="Rootless Docker">
+  Where supported, workloads that do not require direct hardware or kernel access are run under rootless Docker. Rootless mode runs the Docker daemon and all containers as an unprivileged user, eliminating the risk of container escapes granting root on the host.
+
+  Rootless hosts are identified in the inventory with the role suffix `-rootless`. The socket path on these hosts is `/run/user/<uid>/docker.sock`.
+</Accordion>
+
+<Accordion title="Linux Capabilities">
+  All containers start with Docker's default capability set. Any stack that requires additional capabilities must explicitly declare them in the Compose file and have a documented justification in the stack README.
+
+  Capabilities are **never** granted via `--privileged`. If a service genuinely needs privileged mode, it is reviewed and approved as an exception.
+
+  ```yaml
+  cap_add:
+    - NET_ADMIN   # Required for WireGuard interface management
+  cap_drop:
+    - ALL         # Drop all first, then re-add only what is needed
+  ```
+</Accordion>
+
+<Accordion title="Seccomp Profiles">
+  The default Docker seccomp profile is applied to all containers. Services with unusual syscall requirements (e.g., `io_uring`-heavy workloads) use a custom profile stored in `/opt/chip/config/seccomp/` rather than disabling seccomp entirely.
+
+  ```yaml
+  security_opt:
+    - seccomp:/opt/chip/config/seccomp/my-service.json
+  ```
+</Accordion>
+
+<Accordion title="AppArmor">
+  All production hosts run the `docker-default` AppArmor profile. Custom AppArmor profiles for specific services are stored in `/etc/apparmor.d/chip/` and loaded at host boot via `apparmor_parser`.
+
+  ```yaml
+  security_opt:
+    - apparmor:docker-default
+  ```
+</Accordion>
+
+<Warning>
+Never set `security_opt: - no-new-privileges:false` in a production Compose file. This overrides the daemon-level `no-new-privileges` setting and allows privilege escalation inside the container. If a service claims it requires this, escalate to the infrastructure team for review.
+</Warning>
+
+## Health Check Standards
+
+Every service definition should include a `healthcheck` block. Docker's health check status feeds into the monitoring stack and is used by dependent services to gate startup ordering.
+
+```yaml
+healthcheck:
+  test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 15s
+```
+
+<Tip>
+Use `start_period` generously for services with slow initialization (e.g., JVM-based apps, databases). This prevents the container from being marked unhealthy — and potentially restarted — before the application has fully started.
+</Tip>

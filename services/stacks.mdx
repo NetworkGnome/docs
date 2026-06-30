@@ -1,0 +1,375 @@
+---
+title: "Service Stacks: Docker Compose Application Groups"
+sidebarTitle: "Stacks"
+description: "Browse the CHIP service stack catalog, understand stack organization by function, and learn how to deploy, update, and manage stacks in production."
+---
+
+In CHIP, a **stack** is a Docker Compose application group — a collection of one or more related containers that are deployed, managed, and versioned together as a single unit. Stacks are the primary unit of service delivery on the platform. Rather than managing individual containers ad-hoc, every workload belongs to a named stack with a canonical Compose file, a dedicated data directory, and clear ownership. This model makes it straightforward to reason about what is running, where it lives, and how it is updated.
+
+## How Stacks Are Organized
+
+Stacks are grouped by function and co-located on the host best suited to their workload profile. The naming convention is `<function>-<qualifier>`, for example `monitoring-core` or `media-server`. Each stack lives under `/opt/chip/stacks/<stack-name>/` on its host and its persistent data under `/opt/chip/data/<stack-name>/`.
+
+<CardGroup cols={2}>
+  <Card title="Monitoring" icon="chart-line">
+    Metrics collection, visualization, and alerting. Includes Prometheus, Grafana, and Alertmanager. Runs on the dedicated monitoring host `docker-mon-01`.
+  </Card>
+  <Card title="Reverse Proxy" icon="arrow-right-arrow-left">
+    Ingress and TLS termination layer. Traefik routes all inbound HTTP/HTTPS traffic to upstream services with automatic certificate management.
+  </Card>
+  <Card title="Media" icon="photo-film">
+    Media acquisition, organization, and streaming. Includes Jellyfin, Sonarr, Radarr, Prowlarr, and supporting tooling on `docker-media-01`.
+  </Card>
+  <Card title="Home Automation" icon="house-signal">
+    Home Assistant, Node-RED, Zigbee2MQTT, and MQTT broker. Runs on `docker-prod-01` with macvlan network access to the IoT VLAN.
+  </Card>
+  <Card title="Networking" icon="network-wired">
+    DNS (AdGuard Home), DHCP helpers, and VPN gateway (WireGuard). These stacks run in host-network mode.
+  </Card>
+  <Card title="Development" icon="code">
+    Gitea, Woodpecker CI, and supporting tooling on `docker-dev-01`. Not exposed to WAN; LAN-only access.
+  </Card>
+</CardGroup>
+
+## Stack Reference Catalog
+
+The table below lists all active stacks across the CHIP platform.
+
+| Stack Name | Services Included | Host | Port(s) | Description |
+|---|---|---|---|---|
+| `monitoring-core` | Prometheus, Grafana, Alertmanager | `docker-mon-01` | 3000, 9090, 9093 | Core metrics and alerting |
+| `monitoring-agents` | Node Exporter, cAdvisor, Blackbox Exporter | All hosts | 9100, 8080, 9115 | Per-host metric exporters |
+| `proxy-ingress` | Traefik, Authelia | `docker-prod-01` | 80, 443, 8080 | Reverse proxy and SSO auth |
+| `media-server` | Jellyfin, Tdarr | `docker-media-01` | 8096, 8265 | Media streaming and transcoding |
+| `media-arr` | Sonarr, Radarr, Prowlarr, Bazarr | `docker-media-01` | 8989, 7878, 9696, 6767 | Media acquisition automation |
+| `media-download` | qBittorrent, SABnzbd | `docker-media-01` | 8080, 8085 | Download clients |
+| `home-automation` | Home Assistant, Node-RED, Zigbee2MQTT | `docker-prod-01` | 8123, 1880, 8124 | Home automation platform |
+| `mqtt-broker` | Mosquitto | `docker-prod-01` | 1883, 8883 | MQTT message broker |
+| `networking-dns` | AdGuard Home | `docker-prod-02` | 3000, 53 | Network-wide DNS / ad filtering |
+| `networking-vpn` | WireGuard, wg-easy | `docker-prod-02` | 51820/udp, 51821 | VPN gateway |
+| `dev-platform` | Gitea, Woodpecker CI, Woodpecker Agent | `docker-dev-01` | 3001, 8000 | Source control and CI |
+| `logs-aggregation` | Loki, Promtail, Grafana (shared) | `docker-mon-01` | 3100 | Centralized log aggregation |
+| `secrets-manager` | Vault (dev mode) | `docker-dev-01` | 8200 | Secrets for development stacks |
+
+## Example Stack Compose Files
+
+<Tabs>
+  <Tab title="Monitoring Core">
+    The `monitoring-core` stack is the platform's observability foundation. Prometheus scrapes metrics from all hosts and services; Grafana provides dashboards; Alertmanager routes alerts to notification channels.
+
+    ```yaml
+    # /opt/chip/stacks/monitoring-core/docker-compose.yml
+    services:
+      prometheus:
+        image: registry.chip.internal/library/prom/prometheus:v2.52.0
+        container_name: prometheus
+        restart: unless-stopped
+        volumes:
+          - /opt/chip/config/monitoring-core/prometheus:/etc/prometheus:ro
+          - /opt/chip/data/monitoring-core/prometheus:/prometheus
+        command:
+          - "--config.file=/etc/prometheus/prometheus.yml"
+          - "--storage.tsdb.path=/prometheus"
+          - "--storage.tsdb.retention.time=30d"
+          - "--web.enable-lifecycle"
+        networks:
+          - monitoring-net
+        healthcheck:
+          test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy || exit 1"]
+          interval: 30s
+          timeout: 10s
+          retries: 3
+
+      grafana:
+        image: registry.chip.internal/library/grafana/grafana:10.4.3
+        container_name: grafana
+        restart: unless-stopped
+        env_file: .env
+        volumes:
+          - /opt/chip/data/monitoring-core/grafana:/var/lib/grafana
+          - /opt/chip/config/monitoring-core/grafana/provisioning:/etc/grafana/provisioning:ro
+        networks:
+          - monitoring-net
+        depends_on:
+          prometheus:
+            condition: service_healthy
+
+      alertmanager:
+        image: registry.chip.internal/library/prom/alertmanager:v0.27.0
+        container_name: alertmanager
+        restart: unless-stopped
+        volumes:
+          - /opt/chip/config/monitoring-core/alertmanager:/etc/alertmanager:ro
+          - /opt/chip/data/monitoring-core/alertmanager:/alertmanager
+        command:
+          - "--config.file=/etc/alertmanager/alertmanager.yml"
+          - "--storage.path=/alertmanager"
+        networks:
+          - monitoring-net
+
+    networks:
+      monitoring-net:
+        driver: bridge
+    ```
+  </Tab>
+  <Tab title="Home Automation">
+    The `home-automation` stack uses a macvlan network so Home Assistant can communicate natively on the IoT VLAN, which is required for certain local integrations that do not work through NAT.
+
+    ```yaml
+    # /opt/chip/stacks/home-automation/docker-compose.yml
+    services:
+      homeassistant:
+        image: registry.chip.internal/library/homeassistant/home-assistant:2024.6.4
+        container_name: homeassistant
+        restart: unless-stopped
+        privileged: false
+        cap_add:
+          - NET_ADMIN
+        volumes:
+          - /opt/chip/data/home-automation/homeassistant:/config
+          - /etc/localtime:/etc/localtime:ro
+        networks:
+          iot-macvlan:
+            ipv4_address: 10.10.50.10
+        healthcheck:
+          test: ["CMD-SHELL", "curl -sf http://localhost:8123 || exit 1"]
+          interval: 60s
+          timeout: 15s
+          retries: 3
+          start_period: 60s
+
+      node-red:
+        image: registry.chip.internal/library/nodered/node-red:3.1.9
+        container_name: node-red
+        restart: unless-stopped
+        volumes:
+          - /opt/chip/data/home-automation/node-red:/data
+        networks:
+          - iot-macvlan
+          - automation-internal
+        depends_on:
+          homeassistant:
+            condition: service_healthy
+
+      zigbee2mqtt:
+        image: registry.chip.internal/library/koenkk/zigbee2mqtt:1.38.0
+        container_name: zigbee2mqtt
+        restart: unless-stopped
+        volumes:
+          - /opt/chip/data/home-automation/zigbee2mqtt:/app/data
+          - /run/udev:/run/udev:ro
+        devices:
+          - /dev/serial/by-id/usb-ITead_Sonoff_Zigbee_3.0_USB_Dongle_Plus:/dev/ttyUSB0
+        networks:
+          - automation-internal
+
+    networks:
+      iot-macvlan:
+        driver: macvlan
+        driver_opts:
+          parent: eth0.50
+        ipam:
+          config:
+            - subnet: 10.10.50.0/24
+              gateway: 10.10.50.1
+      automation-internal:
+        driver: bridge
+    ```
+  </Tab>
+  <Tab title="Media Acquisition">
+    The `media-arr` stack runs the *arr suite of media automation tools. All services share a common bridge network and bind-mount paths to the media library on the NAS NFS mount.
+
+    ```yaml
+    # /opt/chip/stacks/media-arr/docker-compose.yml
+    services:
+      sonarr:
+        image: registry.chip.internal/library/linuxserver/sonarr:4.0.5
+        container_name: sonarr
+        restart: unless-stopped
+        env_file: .env
+        volumes:
+          - /opt/chip/data/media-arr/sonarr:/config
+          - /mnt/nas/media/tv:/tv
+          - /mnt/nas/downloads:/downloads
+        networks:
+          - arr-net
+
+      radarr:
+        image: registry.chip.internal/library/linuxserver/radarr:5.6.0
+        container_name: radarr
+        restart: unless-stopped
+        env_file: .env
+        volumes:
+          - /opt/chip/data/media-arr/radarr:/config
+          - /mnt/nas/media/movies:/movies
+          - /mnt/nas/downloads:/downloads
+        networks:
+          - arr-net
+
+      prowlarr:
+        image: registry.chip.internal/library/linuxserver/prowlarr:1.19.0
+        container_name: prowlarr
+        restart: unless-stopped
+        env_file: .env
+        volumes:
+          - /opt/chip/data/media-arr/prowlarr:/config
+        networks:
+          - arr-net
+
+    networks:
+      arr-net:
+        driver: bridge
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+Store all stack-specific configuration values — image tags, UIDs/GIDs, timezone, resource limits, and any non-secret environment variables — in a `.env` file alongside `docker-compose.yml`. This lets you audit changes through version control without mixing configuration concerns into the Compose file itself. Secret values (API keys, passwords) must go into `/opt/chip/secrets/<stack-name>/` and be referenced via Docker secrets or a secrets-file environment variable, never inline in `.env`.
+</Tip>
+
+## Deploying a New Stack
+
+<Steps>
+  <Step title="Choose the target host">
+    Consult the host inventory to identify the appropriate host. Choose based on workload type (media, monitoring, automation), available resources, and VLAN requirements.
+  </Step>
+  <Step title="Create the stack directory tree">
+    On the target host, create the standard directory structure for the new stack.
+
+    ```bash
+    STACK=my-new-stack
+    sudo mkdir -p /opt/chip/stacks/${STACK}
+    sudo mkdir -p /opt/chip/data/${STACK}
+    sudo mkdir -p /opt/chip/config/${STACK}
+    cd /opt/chip/stacks/${STACK}
+    ```
+  </Step>
+  <Step title="Write docker-compose.yml and .env">
+    Create the Compose file with pinned image tags, resource limits, restart policies, and health checks. Create the `.env` file for all non-secret configuration values.
+
+    ```bash
+    sudo nano docker-compose.yml
+    sudo nano .env
+    ```
+
+    Set restrictive permissions on the `.env` file so it is not world-readable.
+
+    ```bash
+    sudo chmod 640 .env
+    sudo chown root:docker .env
+    ```
+  </Step>
+  <Step title="Validate the Compose file">
+    Use `docker compose config` to validate the file and confirm all variable substitutions resolve correctly.
+
+    ```bash
+    sudo docker compose config
+    ```
+  </Step>
+  <Step title="Pull images from the internal registry">
+    Pull all images before starting to catch registry connectivity issues early.
+
+    ```bash
+    sudo docker compose pull
+    ```
+  </Step>
+  <Step title="Start the stack">
+    Bring the stack up in detached mode.
+
+    ```bash
+    sudo docker compose up -d
+    ```
+  </Step>
+  <Step title="Verify health and connectivity">
+    Confirm all containers are healthy, review startup logs, and verify any expected service endpoints are reachable.
+
+    ```bash
+    sudo docker compose ps
+    sudo docker compose logs --follow --tail=100
+    ```
+  </Step>
+  <Step title="Register the stack in CHIP inventory">
+    Update the platform stack catalog by adding an entry to `inventory/stacks.yml` in the CHIP GitOps repository and opening a pull request. This keeps the reference table in this document accurate and ensures the stack is included in backup and monitoring coverage.
+  </Step>
+</Steps>
+
+## Updating a Stack
+
+<Accordion title="Standard update process (pull and recreate)">
+  The standard update workflow pulls new images and recreates affected containers with zero manual intervention.
+
+  ```bash
+  cd /opt/chip/stacks/<stack-name>
+
+  # Pull updated images
+  sudo docker compose pull
+
+  # Recreate containers using the new images
+  sudo docker compose up -d --remove-orphans
+
+  # Confirm everything came up healthy
+  sudo docker compose ps
+  ```
+
+  The `--remove-orphans` flag removes containers for services that have been removed from the Compose file since the last deployment, preventing stale containers from accumulating.
+</Accordion>
+
+<Accordion title="Updating a single service within a stack">
+  To update only one service without touching the rest of the stack, specify the service name.
+
+  ```bash
+  sudo docker compose pull sonarr
+  sudo docker compose up -d --no-deps sonarr
+  ```
+
+  The `--no-deps` flag prevents Docker Compose from recreating dependent services.
+</Accordion>
+
+<Accordion title="Rolling back to a previous version">
+  To roll back, update the image tag in `docker-compose.yml` to the previous known-good version and redeploy.
+
+  ```bash
+  # Edit docker-compose.yml to pin the previous tag
+  sudo nano docker-compose.yml
+
+  # Pull the old image (may already be cached locally)
+  sudo docker compose pull
+
+  # Recreate with the old image
+  sudo docker compose up -d
+  ```
+
+  Old images are retained on the host for 48 hours before the weekly `docker image prune` job removes unreferenced images.
+</Accordion>
+
+## Health Checks and Dependency Management
+
+Every service in a production stack must declare a `healthcheck`. Dependent services must use `condition: service_healthy` in their `depends_on` block so that startup ordering respects actual application readiness rather than just container start time.
+
+```yaml
+depends_on:
+  prometheus:
+    condition: service_healthy
+  postgres:
+    condition: service_healthy
+```
+
+<Note>
+Docker Compose `depends_on` with `condition: service_healthy` only controls startup ordering within a single `docker compose up` invocation. If an upstream service becomes unhealthy after startup, Docker Compose does not automatically restart downstream containers. Use Traefik health checks or an external watchdog for runtime dependency enforcement.
+</Note>
+
+## Cleanup and Maintenance
+
+Run the following commands periodically on each host to reclaim disk space from unused images, stopped containers, and dangling volumes. These commands run automatically every Sunday at 02:00 via the platform maintenance cron job, but can be run manually at any time against non-production stacks.
+
+```bash
+# Remove stopped containers, unused networks, dangling images, and build cache
+sudo docker system prune -f
+
+# Additionally remove unused images (not just dangling)
+sudo docker image prune -a -f --filter "until=168h"
+```
+
+<Warning>
+Do not run `docker system prune -a` on a production host without first confirming which images are in active use. The `-a` flag removes all unused images, including those that are not currently running but may be needed for a fast rollback.
+</Warning>

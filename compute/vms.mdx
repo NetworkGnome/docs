@@ -1,0 +1,342 @@
+---
+title: "VM & LXC Container Management in Proxmox VE"
+sidebarTitle: "VMs & Containers"
+description: "Manage virtual machines and LXC containers on CHIP: creation, templates, cloud-init, lifecycle operations, naming conventions, and resource limits."
+---
+
+CHIP supports two compute primitives on Proxmox VE: **KVM virtual machines** (VMs) and **LXC containers**. VMs provide full hardware emulation with complete OS isolation, while LXC containers share the host kernel for a lighter-weight footprint. Choosing the right primitive up front avoids unnecessary migration later and ensures your workload gets the performance profile and isolation guarantees it needs. This page covers the decision criteria, naming conventions, full lifecycle management, and configuration details for both types.
+
+## VM vs LXC: Decision Criteria
+
+<Tabs>
+  <Tab title="Virtual Machines (KVM)">
+    Use a KVM VM when your workload requires:
+
+    - A **non-Linux operating system** (Windows Server, FreeBSD, etc.)
+    - A **custom kernel** or kernel module that conflicts with the host kernel
+    - **Strong isolation** between tenants (e.g., customer-facing services, security tooling)
+    - **Live migration** between nodes, including across different kernel versions
+    - **Nested virtualization** (e.g., running a hypervisor inside the VM)
+    - A workload that produces significant disk I/O variance (VMs get dedicated virtual block devices)
+
+    VMs carry a higher memory overhead (guest OS + QEMU process) and slightly higher CPU overhead, but the isolation and compatibility guarantees are worth it for the above cases.
+
+    **Typical CHIP use cases:** application servers, database primaries, Windows-based services, CI runners, customer tenant environments.
+  </Tab>
+  <Tab title="LXC Containers">
+    Use an LXC container when your workload:
+
+    - Runs a **standard Linux distribution** (Debian, Ubuntu, Alpine) without custom kernel requirements
+    - Benefits from **near-bare-metal performance** with minimal memory overhead
+    - Is a well-understood, trusted internal service with no multi-tenant concerns
+    - Needs to be **provisioned in bulk** quickly (containers start in under 2 seconds)
+    - Runs **stateless or ephemeral** processes where snapshot-based recovery is sufficient
+
+    LXC containers share the host's Linux kernel, so any exploit that escapes the container namespace can affect the host and neighbouring containers. Do not run untrusted or customer-supplied code in LXC containers.
+
+    **Typical CHIP use cases:** internal tooling, monitoring agents, log shippers, DNS resolvers, DHCP servers, jumpboxes.
+  </Tab>
+</Tabs>
+
+<Info>
+  When in doubt, choose a **VM**. The additional isolation overhead is negligible for most workloads, and VMs support a wider range of Proxmox features including live migration and some snapshot strategies that are not available for all LXC configurations.
+</Info>
+
+## Naming Conventions
+
+Consistent naming makes automation, alerting, and audit trails vastly easier to manage. All VMs and containers in CHIP must follow the naming scheme below.
+
+### Naming Pattern
+
+```
+<env>-<team>-<role>-<index>
+```
+
+| Segment  | Values                                      | Example         |
+|----------|---------------------------------------------|-----------------|
+| `env`    | `prod`, `stg`, `dev`, `lab`                 | `prod`          |
+| `team`   | Short team identifier (max 8 chars)         | `platform`      |
+| `role`   | Functional role of the VM (max 12 chars)    | `appserver`     |
+| `index`  | Zero-padded two-digit integer               | `01`            |
+
+**Full examples:**
+
+| VMID | Name                       | Type | Environment | Team     | Role         |
+|------|----------------------------|------|-------------|----------|--------------|
+| 200  | `prod-platform-appserver-01` | VM   | Production  | Platform | App server   |
+| 201  | `prod-platform-appserver-02` | VM   | Production  | Platform | App server   |
+| 250  | `prod-data-postgres-01`    | VM   | Production  | Data     | Postgres DB  |
+| 300  | `dev-platform-appserver-01`| VM   | Dev         | Platform | App server   |
+| 400  | `prod-infra-dns-01`        | LXC  | Production  | Infra    | DNS resolver |
+| 401  | `prod-infra-dns-02`        | LXC  | Production  | Infra    | DNS resolver |
+
+<Note>
+  VMID ranges are pre-allocated by environment: **100–199** for infrastructure, **200–299** for production workloads, **300–399** for staging, **400–499** for development, and **500+** for templates and scratch. Claim your VMID range with the infrastructure team before deploying to avoid collisions.
+</Note>
+
+## Template Library
+
+CHIP maintains a set of pre-built VM templates on the `nfs-backup` storage at path `/mnt/templates/`. Templates are versioned and refreshed monthly with the latest OS patches applied. Do not use a template older than 90 days for new deployments.
+
+| Template Name                   | OS                   | Type | Cloud-Init | Notes                          |
+|---------------------------------|----------------------|------|------------|--------------------------------|
+| `tmpl-ubuntu-2404-server`       | Ubuntu 24.04 LTS     | VM   | Yes        | Default for new Linux VMs      |
+| `tmpl-ubuntu-2204-server`       | Ubuntu 22.04 LTS     | VM   | Yes        | Legacy; use 24.04 for new work |
+| `tmpl-debian-12-server`         | Debian 12 Bookworm   | VM   | Yes        | Preferred for infra tooling    |
+| `tmpl-windows-2022-std`         | Windows Server 2022  | VM   | No         | Use Sysprep for customisation  |
+| `tmpl-alpine-319-lxc`           | Alpine Linux 3.19    | LXC  | No         | Minimal footprint containers   |
+| `tmpl-ubuntu-2404-lxc`          | Ubuntu 24.04 LTS     | LXC  | No         | Standard LXC base              |
+
+## Creating a New VM
+
+<Steps>
+  <Step title="Log in to the Proxmox web UI">
+    Navigate to `https://proxmox.chip.internal:8006` and authenticate with your `chip-ldap` credentials. Ensure you have `PVEVMAdmin` permissions on the target resource pool before proceeding.
+  </Step>
+  <Step title="Start the VM creation wizard">
+    Right-click the target node (e.g., `pve-node-02`) in the left-hand tree and select **Create VM**, or click the **Create VM** button in the top-right toolbar. The wizard opens with the **General** tab active.
+  </Step>
+  <Step title="Set VM identity">
+    - **Node:** Select the node that matches your HA group preference.
+    - **VM ID:** Enter the next available ID in the appropriate range (see naming conventions above).
+    - **Name:** Follow the `<env>-<team>-<role>-<index>` pattern exactly.
+    - **Resource Pool:** Select your team's resource pool from the dropdown.
+
+    Click **Next**.
+  </Step>
+  <Step title="Select the OS template">
+    On the **OS** tab, set **Storage** to `nfs-backup` and choose the appropriate ISO or template from the list (e.g., `tmpl-ubuntu-2404-server`). Set **Guest OS Type** and **Version** to match your chosen OS. Click **Next**.
+  </Step>
+  <Step title="Configure the system disk">
+    On the **Disks** tab:
+    - Set **Storage** to `ceph-rbd` if the VM needs HA or live migration; use `local-lvm` for non-HA workloads.
+    - Set **Disk size** according to your workload's storage tier requirements (see the [Storage](/compute/storage) page).
+    - Enable **Discard** and **SSD emulation** for NVMe-backed storage pools.
+
+    Click **Next**.
+  </Step>
+  <Step title="Allocate CPU and memory">
+    On the **CPU** tab, set the number of **Cores**. On the **Memory** tab, set **Memory (MiB)**. Stay within the resource quotas defined for your pool (see [Resource Limits](#resource-limits) below). Click **Next** after each tab.
+  </Step>
+  <Step title="Assign the network interface">
+    On the **Network** tab:
+    - Set **Bridge** to the appropriate bridge for your environment (`vmbr2` for production, `vmbr3` for dev/staging — see the [Proxmox](/compute/proxmox) network bridge table).
+    - Leave **Model** as `VirtIO (paravirtualized)` for best performance on Linux guests.
+    - Assign a **MAC address** if you need a static DHCP reservation; otherwise leave it auto-generated.
+
+    Click **Next**.
+  </Step>
+  <Step title="Enable cloud-init (Linux VMs only)">
+    On the **Confirm** tab, check **Start after created** only if you have finished cloud-init configuration. Before starting, navigate to the VM → **Cloud-Init** tab in the detail pane and set: **User**, **Password** or **SSH public key**, **IP configuration**, and **DNS domain**. See the [Cloud-Init Configuration](#cloud-init-configuration) section for full details.
+  </Step>
+  <Step title="Review and create">
+    Review the summary on the **Confirm** tab. Click **Finish**. The VM appears in the resource tree within a few seconds. Start it by clicking **Start** in the toolbar or running `qm start <vmid>` from any cluster node.
+  </Step>
+</Steps>
+
+## Cloud-Init Configuration
+
+<Tip>
+  Use cloud-init for every new Linux VM. It eliminates the need for manual first-boot configuration, enables fully automated provisioning via Terraform or Ansible, and ensures credentials are injected from the secrets vault rather than hard-coded in templates.
+</Tip>
+
+Cloud-init data is attached to the VM as a virtual CD-ROM drive generated by Proxmox. Set all cloud-init parameters before the first boot — changes after first boot require a rebuild of the cloud-init drive.
+
+```bash
+# Set cloud-init options via CLI (run from any cluster node)
+qm set 200 --ciuser ubuntu
+qm set 200 --sshkeys /etc/pve/keys/jsmith.pub
+qm set 200 --ipconfig0 ip=10.20.1.50/22,gw=10.20.0.1
+qm set 200 --nameserver 10.0.0.53
+qm set 200 --searchdomain chip.internal
+
+# Regenerate the cloud-init drive after changes
+qm cloudinit update 200
+```
+
+For Terraform-based provisioning, CHIP provides a reusable module in the internal registry:
+
+```hcl
+module "vm" {
+  source       = "registry.chip.internal/compute/proxmox-vm/chip"
+  version      = "~> 2.0"
+
+  vm_id        = 200
+  name         = "prod-platform-appserver-01"
+  node         = "pve-node-02"
+  template     = "tmpl-ubuntu-2404-server"
+  cores        = 4
+  memory_mb    = 8192
+  disk_gb      = 50
+  storage_pool = "ceph-rbd"
+  bridge       = "vmbr2"
+  ip_address   = "10.20.1.50/22"
+  gateway      = "10.20.0.1"
+  ssh_keys     = [var.operator_ssh_pubkey]
+  pool         = "pool-platform"
+}
+```
+
+## VM Lifecycle Operations
+
+<Accordion title="Starting, stopping, and rebooting">
+  ```bash
+  # Start a VM
+  qm start <vmid>
+
+  # Graceful shutdown (sends ACPI signal to guest OS)
+  qm shutdown <vmid>
+
+  # Force stop (equivalent to pulling power — use only if shutdown hangs)
+  qm stop <vmid>
+
+  # Reboot
+  qm reboot <vmid>
+  ```
+
+  For LXC containers, substitute `pct` for `qm`:
+  ```bash
+  pct start <ctid>
+  pct shutdown <ctid>
+  pct reboot <ctid>
+  ```
+</Accordion>
+
+<Accordion title="Taking and restoring snapshots">
+  Snapshots capture the VM's disk state (and optionally RAM) at a point in time. Always take a snapshot before applying OS upgrades or configuration changes.
+
+  ```bash
+  # Create a snapshot (VM must use a snapshot-capable storage backend)
+  qm snapshot <vmid> <snapname> --description "Before nginx upgrade" --vmstate 0
+
+  # List snapshots
+  qm listsnapshot <vmid>
+
+  # Roll back to a snapshot
+  qm rollback <vmid> <snapname>
+
+  # Delete a snapshot
+  qm delsnapshot <vmid> <snapname>
+  ```
+
+  <Warning>
+    Snapshots on `local-lvm` (LVM-thin) accumulate I/O overhead over time. Do not retain more than three active snapshots per VM on LVM-thin pools. On `ceph-rbd`, snapshot overhead is negligible.
+  </Warning>
+</Accordion>
+
+<Accordion title="Live migration between nodes">
+  Live migration moves a running VM between nodes with zero downtime, provided the VM disk is on shared storage (`ceph-rbd`).
+
+  ```bash
+  # Migrate VM 200 to pve-node-03 with online (live) migration
+  qm migrate 200 pve-node-03 --online
+
+  # For VMs on local storage, use offline migration (VM pauses briefly)
+  qm migrate 200 pve-node-04
+  ```
+
+  Confirm the migration succeeded by checking the VM's node assignment:
+  ```bash
+  pvesh get /cluster/resources --type vm | jq '.[] | select(.vmid==200) | {node, status}'
+  ```
+</Accordion>
+
+<Accordion title="Backup and restore">
+  Scheduled backups are managed via **Datacenter → Backup** jobs and write to the `nfs-backup` storage. Ad-hoc backups can be triggered via CLI:
+
+  ```bash
+  # Create an on-demand backup using Proxmox Backup Server
+  vzdump <vmid> --storage nfs-backup --mode snapshot --compress zstd
+
+  # Restore from backup (list available backups first)
+  pvesh get /nodes/pve-node-01/storage/nfs-backup/content?content=backup
+
+  # Restore
+  qmrestore /mnt/pve/nfs-backup/dump/vzdump-qemu-200-<timestamp>.zst 200 --storage ceph-rbd
+  ```
+</Accordion>
+
+<Accordion title="Destroying a VM">
+  ```bash
+  # Stop the VM first, then destroy it and its disks
+  qm stop <vmid>
+  qm destroy <vmid> --destroy-unreferenced-disks 1 --purge 1
+  ```
+
+  <Warning>
+    `qm destroy` with `--purge` removes the VM from all backup jobs and HA configuration. This action is **irreversible**. Verify you have a recent backup before destroying any VM that held stateful data.
+  </Warning>
+</Accordion>
+
+## Resource Limits
+
+All VMs and containers are subject to per-pool resource quotas enforced at the Proxmox datacenter level. Requests to exceed these limits must be approved by the infrastructure team.
+
+| Environment | Max vCPU per VM | Max RAM per VM | Max Disk per VM | Max VMs per Pool |
+|-------------|-----------------|----------------|-----------------|------------------|
+| Production  | 32 cores        | 128 GB         | 2 TB            | 50               |
+| Staging     | 16 cores        | 64 GB          | 500 GB          | 20               |
+| Development | 8 cores         | 16 GB          | 200 GB          | 10               |
+| Lab         | 4 cores         | 8 GB           | 100 GB          | 5                |
+
+CPU and memory can be adjusted at runtime without rebooting (hot-plug is enabled on all Linux templates):
+
+```bash
+# Add 2 vCPUs to a running VM (hot-plug must be enabled in VM options)
+qm set 200 --cores 6
+
+# Adjust memory (hot-add only — reducing memory requires a reboot)
+qm set 200 --memory 16384
+```
+
+## LXC-Specific Configuration
+
+<Tabs>
+  <Tab title="Creating an LXC Container">
+    ```bash
+    # Create an LXC container from the Alpine template
+    pct create 400 nfs-backup:vztmpl/alpine-3.19-default_amd64.tar.xz \
+      --hostname prod-infra-dns-01 \
+      --storage zfs-tank \
+      --rootfs zfs-tank:8 \
+      --cores 2 \
+      --memory 512 \
+      --net0 name=eth0,bridge=vmbr2,ip=10.20.2.10/22,gw=10.20.0.1 \
+      --nameserver 10.0.0.53 \
+      --searchdomain chip.internal \
+      --unprivileged 1 \
+      --start 1
+    ```
+
+    Always create containers with `--unprivileged 1` unless the workload explicitly requires privileged mode (e.g., running Docker inside LXC). Privileged containers have a significantly larger attack surface.
+  </Tab>
+  <Tab title="Key Differences from VMs">
+    | Feature                  | KVM VM                          | LXC Container                   |
+    |--------------------------|---------------------------------|----------------------------------|
+    | Kernel                   | Guest OS kernel (isolated)      | Host kernel (shared)             |
+    | Boot time                | 30–60 seconds                   | 1–3 seconds                      |
+    | Memory overhead          | ~200 MB (QEMU + guest OS init)  | ~5–20 MB                         |
+    | Live migration           | Supported (with shared storage) | Supported                        |
+    | Snapshot support         | Full disk + optional RAM        | Disk only (no RAM snapshots)     |
+    | Cloud-init support       | Yes                             | No (use `pct exec` for init)     |
+    | Windows support          | Yes                             | No                               |
+    | Docker-in-container      | Yes (nested KVM)                | Limited (requires privileged)    |
+    | HA support               | Yes                             | Yes                              |
+    | Storage backend          | `ceph-rbd`, `local-lvm`         | `zfs-tank`, `local-lvm`          |
+  </Tab>
+  <Tab title="Container Console & Exec">
+    ```bash
+    # Open an interactive shell inside a running container
+    pct enter 400
+
+    # Run a single command inside a container non-interactively
+    pct exec 400 -- apk update
+
+    # Copy a file into a container
+    pct push 400 /local/path/file.conf /etc/myapp/file.conf
+
+    # Copy a file out of a container
+    pct pull 400 /etc/myapp/file.conf /local/backup/file.conf
+    ```
+  </Tab>
+</Tabs>

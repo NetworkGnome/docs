@@ -1,0 +1,99 @@
+---
+title: "Runbooks: Documented Infrastructure Procedures"
+sidebarTitle: "Overview"
+description: "Learn how CHIP runbooks standardize infrastructure operations, reduce human error, and ensure consistent outcomes across your team."
+---
+
+Runbooks in CHIP are documented, repeatable procedures that guide operators through infrastructure tasks step-by-step. Rather than relying on tribal knowledge or ad-hoc commands entered from memory, runbooks encode the correct sequence of actions, prerequisites, verification steps, and rollback paths into a single authoritative reference. Every time a procedure is executed from a runbook, you get a predictable outcome regardless of who performs it or when.
+
+## When to Use a Runbook
+
+Not every infrastructure action requires a formal runbook. Simple, low-risk operations — such as checking service status or reviewing logs — can be performed ad-hoc. Runbooks are appropriate when the task meets one or more of the following criteria:
+
+- The task has **more than three sequential steps** that must be performed in order
+- The task **affects production services** or has the potential to cause downtime
+- The task is performed **infrequently** (making memorization unreliable)
+- The task requires **coordination across multiple systems** or team members
+- The task has a **non-trivial rollback path** that must be planned in advance
+
+For routine, low-impact tasks (such as reading a metric or tailing a log), ad-hoc operation is acceptable. When in doubt, follow the runbook.
+
+## Runbook Structure
+
+Every runbook in CHIP follows a consistent structure to make them scannable and predictable under pressure.
+
+| Section | Purpose |
+|---|---|
+| **Title** | A short, action-oriented name describing what the runbook accomplishes |
+| **Trigger** | The condition or request that initiates this runbook |
+| **Prerequisites** | Permissions, tools, credentials, and system states required before starting |
+| **Steps** | Numbered, sequential actions with exact commands or UI paths |
+| **Verification** | How to confirm the procedure succeeded without side effects |
+| **Rollback** | How to safely undo the operation if something goes wrong |
+| **Owner** | The team or role responsible for keeping the runbook current |
+
+## Runbook Index
+
+The following table lists all runbooks currently maintained in CHIP. Use the Trigger column to identify the right runbook for your situation.
+
+| Runbook Name | Trigger | Est. Duration | Owner |
+|---|---|---|---|
+| Restart a Docker Service | Service unhealthy or unresponsive | 5 min | Platform Ops |
+| Add a New VM to Inventory | New VM provisioned in Proxmox | 15 min | Platform Ops |
+| Update a DNS Record | Hostname change or new service | 10 min | Network Ops |
+| Rotate SSH Keys for an Operator | Operator offboarding or key compromise | 20 min | Security |
+| Deploy a New Docker Stack | New application deployment request | 30 min | Platform Ops |
+| Add a VLAN to a Switch Port | Network segmentation request | 15 min | Network Ops |
+| Proxmox Node Maintenance | Scheduled patch window | 60 min | Platform Ops |
+| Docker Host OS Patching | Scheduled patch window | 45 min | Platform Ops |
+| Docker Image Updates | New image available or CVE | 30 min | Platform Ops |
+| VM Restore from PBS | Data loss or VM corruption | 45 min | Platform Ops |
+| LXC Container Restore | Container failure or data loss | 30 min | Platform Ops |
+| Docker Volume Restore | Application data loss | 20 min | Platform Ops |
+
+## Runbook Categories
+
+<CardGroup cols={2}>
+  <Card title="Common Tasks" icon="list-check" href="/runbooks/common-tasks">
+    Frequently performed day-to-day operations including service restarts, DNS updates, SSH key rotation, and Docker deployments.
+  </Card>
+  <Card title="Maintenance" icon="wrench" href="/runbooks/maintenance">
+    Scheduled maintenance procedures for Proxmox nodes, OS patching, and Docker image lifecycle management.
+  </Card>
+  <Card title="Backup Procedures" icon="database" href="/disaster-recovery/backups">
+    Backup architecture, job configurations, verification steps, and offsite replication details.
+  </Card>
+  <Card title="Restoration Procedures" icon="rotate-left" href="/disaster-recovery/restoration">
+    Step-by-step restoration flows for VMs, containers, and Docker volumes from backup.
+  </Card>
+</CardGroup>
+
+## Executing a Runbook
+
+Before you begin any runbook, complete these universal pre-flight checks:
+
+1. **Open a change ticket** in your ITSM system and record the runbook name and ticket number.
+2. **Confirm the maintenance window** with affected stakeholders if the task may cause downtime.
+3. **Verify your credentials** — confirm you have the required permissions listed in the Prerequisites section before starting.
+4. **Have rollback ready** — read the rollback section before beginning, not after something goes wrong.
+
+After completing each step, note any deviations from the documented procedure in your change ticket. If you had to improvise a step, record what you did and why.
+
+## Continuous Improvement
+
+Runbooks drift from reality over time as systems evolve. The most dangerous runbook is one that looks current but contains outdated commands or stale credentials. Every execution is an opportunity to verify accuracy.
+
+<Tip>
+  After every runbook execution — successful or not — review each step against what you actually performed. If any step required modification, update the runbook immediately and note the change in your ITSM ticket. Even minor updates (a changed flag, a renamed service) prevent the next operator from being caught off guard.
+</Tip>
+
+## Runbook Governance
+
+Runbooks are owned by the teams listed in the Runbook Index. Owners are responsible for:
+
+- Reviewing their runbooks at least **quarterly**
+- Updating procedures after any infrastructure change that affects the runbook
+- Testing runbooks in a non-production environment before publishing major revisions
+- Archiving runbooks that are no longer applicable and documenting the reason
+
+If you identify an error in a runbook owned by another team, open a documentation issue and notify the owner directly. Do not make changes to another team's runbook without their review.

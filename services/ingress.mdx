@@ -1,0 +1,417 @@
+---
+title: "Ingress: Reverse Proxy & TLS Termination Layer"
+sidebarTitle: "Ingress"
+description: "Traefik-based ingress architecture, TLS certificate management, hostname routing rules, middleware configuration, and service exposure procedures."
+---
+
+CHIP uses [Traefik](https://traefik.io/traefik/) as its ingress controller and reverse proxy. Traefik runs in the `proxy-ingress` stack on `docker-prod-01` and acts as the single entry point for all HTTP and HTTPS traffic entering the platform — both from the public internet and from the internal LAN. It performs TLS termination, routes requests to upstream containers by hostname, enforces authentication middleware via Authelia, and automatically provisions and renews TLS certificates through Let's Encrypt. All service exposure decisions — what is routable, on which interface, and whether authentication is required — are declared in Traefik's dynamic configuration.
+
+## Ingress Architecture
+
+```
+Internet / LAN
+      │
+      ▼
+ [Firewall / Router]
+      │  :80 and :443 forwarded (WAN-exposed services only)
+      ▼
+ docker-prod-01 (10.10.1.11)
+ ┌───────────────────────────────────────┐
+ │  Traefik (proxy-ingress stack)        │
+ │  Entrypoints: :80 (web), :443 (websecure) │
+ │  Dashboard:   :8080 (LAN only)        │
+ └──────┬──────────────┬─────────────────┘
+        │              │
+        ▼              ▼
+  LAN services   WAN services
+  (internal      (authelia SSO
+   network only)  middleware applied)
+```
+
+Traefik discovers service routes through Docker provider labels on running containers. When a container is started with the appropriate labels, Traefik automatically registers the route — no static config file edit is needed.
+
+## Entry Points
+
+Traefik is configured with two primary entry points. HTTP traffic on port 80 is globally redirected to HTTPS using a redirect middleware applied at the entry point level, so no individual service needs to handle the redirect.
+
+```yaml
+# /opt/chip/config/proxy-ingress/traefik/traefik.yml (static config)
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+
+  websecure:
+    address: ":443"
+    http:
+      tls:
+        certResolver: letsencrypt
+        domains:
+          - main: "chip.example.com"
+            sans:
+              - "*.chip.example.com"
+
+api:
+  dashboard: true
+  insecure: false
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: proxy-net
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: admin@chip.example.com
+      storage: /etc/traefik/acme/acme.json
+      dnsChallenge:
+        provider: cloudflare
+        resolvers:
+          - "1.1.1.1:53"
+          - "8.8.8.8:53"
+```
+
+<Note>
+CHIP uses the DNS-01 ACME challenge with the Cloudflare provider to issue wildcard certificates for `*.chip.example.com`. This means TLS works for any subdomain without requiring a new certificate request per service, and certificate issuance does not require the host to be publicly reachable on port 80 during validation.
+</Note>
+
+## HTTP and HTTPS Routing Configuration
+
+<Tabs>
+  <Tab title="HTTP (Port 80)">
+    All HTTP traffic is automatically redirected to HTTPS at the Traefik entry point level. No service should accept plain HTTP in production. The redirect is permanent (HTTP 301) and is applied globally by the `web` entry point configuration.
+
+    If you need to verify the redirect is working for a specific hostname:
+
+    ```bash
+    curl -I http://grafana.chip.example.com
+    # Expected: HTTP/1.1 301 Moved Permanently
+    # Location: https://grafana.chip.example.com/
+    ```
+
+    In exceptional cases where a service must respond on HTTP (e.g., an ACME HTTP-01 challenge endpoint or a health probe from a device that does not support TLS), a dedicated router with the `web` entry point can be configured in the file provider under `/opt/chip/config/proxy-ingress/traefik/dynamic/`.
+
+    ```yaml
+    # dynamic/http-exception.yml — use sparingly
+    http:
+      routers:
+        my-http-router:
+          entryPoints:
+            - web
+          rule: "Host(`health-probe.chip.internal`)"
+          service: my-http-service
+    ```
+  </Tab>
+  <Tab title="HTTPS (Port 443)">
+    HTTPS routing is driven by Docker labels on each container. Traefik reads labels from all containers on the `proxy-net` Docker network and dynamically builds router and service definitions.
+
+    A minimal HTTPS-enabled service label set looks like this:
+
+    ```yaml
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.chip.example.com`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls=true"
+      - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+    ```
+
+    Traefik uses the wildcard certificate already stored in `acme.json` to serve TLS for any `*.chip.example.com` hostname without a new ACME request.
+
+    For services with multiple ports or where Compose defines more than one exposed port, always explicitly set `traefik.http.services.<name>.loadbalancer.server.port` to the correct upstream port. Without it, Traefik may select the wrong port.
+  </Tab>
+</Tabs>
+
+## Middleware
+
+Traefik middleware is declared in the file provider and referenced by name in router labels. CHIP maintains a standard middleware library in `/opt/chip/config/proxy-ingress/traefik/dynamic/middlewares.yml`.
+
+<Accordion title="Authelia SSO Authentication">
+  Most services accessible from the WAN are protected by [Authelia](https://www.authelia.com/) for single sign-on and two-factor authentication. The Authelia forward-auth middleware intercepts every request to a protected route and redirects unauthenticated users to the SSO login page.
+
+  ```yaml
+  # dynamic/middlewares.yml
+  http:
+    middlewares:
+      authelia:
+        forwardAuth:
+          address: "http://authelia:9091/api/verify?rd=https://auth.chip.example.com"
+          trustForwardHeader: true
+          authResponseHeaders:
+            - Remote-User
+            - Remote-Groups
+            - Remote-Name
+            - Remote-Email
+  ```
+
+  To require authentication on a service, add the middleware to the router label:
+
+  ```yaml
+  labels:
+    - "traefik.http.routers.myservice.middlewares=authelia@file"
+  ```
+</Accordion>
+
+<Accordion title="Security Headers">
+  A `secure-headers` middleware applies a standard security header policy to all externally accessible services. These headers are defined once and reused across all WAN routers.
+
+  ```yaml
+  http:
+    middlewares:
+      secure-headers:
+        headers:
+          stsSeconds: 31536000
+          stsIncludeSubdomains: true
+          stsPreload: true
+          forceSTSHeader: true
+          contentTypeNosniff: true
+          browserXssFilter: true
+          referrerPolicy: "strict-origin-when-cross-origin"
+          permissionsPolicy: "camera=(), microphone=(), geolocation=()"
+          customResponseHeaders:
+            X-Robots-Tag: "noindex, nofollow"
+            Server: ""
+  ```
+</Accordion>
+
+<Accordion title="Rate Limiting">
+  A rate-limit middleware is applied to authentication endpoints and any API surface exposed to the WAN to mitigate brute-force and scraping attacks.
+
+  ```yaml
+  http:
+    middlewares:
+      rate-limit-auth:
+        rateLimit:
+          average: 20
+          burst: 50
+          period: 1m
+          sourceCriterion:
+            ipStrategy:
+              depth: 1
+  ```
+</Accordion>
+
+<Accordion title="Intranet-Only Middleware (IP Allowlist)">
+  Services that should be accessible on the LAN but must never accept connections from the WAN are protected by an IP allowlist middleware. This acts as a second line of defense even if a firewall rule is misconfigured.
+
+  ```yaml
+  http:
+    middlewares:
+      lan-only:
+        ipAllowList:
+          sourceRange:
+            - "10.0.0.0/8"
+            - "172.16.0.0/12"
+            - "192.168.0.0/16"
+  ```
+
+  Apply it to a router:
+
+  ```yaml
+  labels:
+    - "traefik.http.routers.myservice.middlewares=lan-only@file"
+  ```
+</Accordion>
+
+## Internal vs. External Service Exposure
+
+Services are classified into three tiers based on exposure scope.
+
+<CardGroup cols={3}>
+  <Card title="WAN-Exposed" icon="globe">
+    Routed through Traefik on the public IP. Require Authelia SSO + secure-headers middleware. Only explicitly approved services reach this tier. Examples: Jellyfin, Home Assistant (remote access profile).
+  </Card>
+  <Card title="LAN-Only" icon="house-lock">
+    Routed through Traefik but only reachable from RFC 1918 address space via the `lan-only` IP allowlist middleware. Examples: Grafana, Traefik dashboard, Gitea, Proxmox UI.
+  </Card>
+  <Card title="Cluster-Internal" icon="lock">
+    Not registered with Traefik at all. Reachable only by containers on the same Docker network. Examples: databases, MQTT broker, Prometheus scrape targets (accessed via Docker DNS name).
+  </Card>
+</CardGroup>
+
+<Warning>
+Think carefully before exposing any service to the WAN. Every WAN-exposed service increases the platform's attack surface. Services must pass a security review checklist before being added to the WAN-exposed tier — at minimum: Authelia protection enabled, secure-headers middleware applied, no default credentials, and a valid rate-limit policy. If in doubt, keep it LAN-only and use the WireGuard VPN for remote access instead.
+</Warning>
+
+## Exposing a New Service Through Ingress
+
+<Steps>
+  <Step title="Decide the exposure tier">
+    Determine whether the service should be WAN-exposed, LAN-only, or cluster-internal. If LAN-only is sufficient, prefer it. For WAN exposure, complete the security review checklist before proceeding.
+  </Step>
+  <Step title="Join the proxy network">
+    The service container must be on the `proxy-net` Docker network so Traefik can reach it. Add the network to the service's Compose definition. The `proxy-net` network is declared as external because it is owned by the `proxy-ingress` stack.
+
+    ```yaml
+    services:
+      my-service:
+        image: registry.chip.internal/library/my-service:1.2.3
+        networks:
+          - my-service-internal
+          - proxy-net
+
+    networks:
+      my-service-internal:
+        driver: bridge
+      proxy-net:
+        external: true
+    ```
+  </Step>
+  <Step title="Add Traefik labels">
+    Add the appropriate labels to the service definition. Choose the middleware chain to match the exposure tier.
+
+    **LAN-only service example:**
+
+    ```yaml
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.my-service.rule=Host(`my-service.chip.example.com`)"
+      - "traefik.http.routers.my-service.entrypoints=websecure"
+      - "traefik.http.routers.my-service.tls=true"
+      - "traefik.http.routers.my-service.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.my-service.middlewares=lan-only@file,secure-headers@file"
+      - "traefik.http.services.my-service.loadbalancer.server.port=8080"
+    ```
+
+    **WAN-exposed service example:**
+
+    ```yaml
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.my-service.rule=Host(`my-service.chip.example.com`)"
+      - "traefik.http.routers.my-service.entrypoints=websecure"
+      - "traefik.http.routers.my-service.tls=true"
+      - "traefik.http.routers.my-service.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.my-service.middlewares=authelia@file,secure-headers@file,rate-limit-auth@file"
+      - "traefik.http.services.my-service.loadbalancer.server.port=8080"
+    ```
+  </Step>
+  <Step title="Recreate the container">
+    Bring the updated stack down and back up so the new labels are registered with the Docker provider.
+
+    ```bash
+    cd /opt/chip/stacks/my-stack
+    sudo docker compose up -d --force-recreate my-service
+    ```
+  </Step>
+  <Step title="Verify the route appears in the Traefik dashboard">
+    Open the Traefik dashboard at `https://traefik.chip.example.com` (LAN access) and confirm the new router appears under **HTTP → Routers** with status **Enabled**.
+
+    Alternatively, check via the Traefik API:
+
+    ```bash
+    curl -s http://localhost:8080/api/http/routers | jq '.[] | select(.name=="my-service@docker")'
+    ```
+  </Step>
+  <Step title="Test the route end to end">
+    Send a test request to confirm TLS is working, the correct upstream is responding, and middleware is applying as expected.
+
+    ```bash
+    # Confirm TLS and HTTP response
+    curl -I https://my-service.chip.example.com
+
+    # Confirm secure headers are present
+    curl -sI https://my-service.chip.example.com | grep -i "strict-transport\|x-content-type"
+
+    # Confirm LAN-only blocks external IPs (run from an external network)
+    curl -I https://my-service.chip.example.com
+    # Expected: 403 Forbidden
+    ```
+  </Step>
+  <Step title="Add a DNS record">
+    If the hostname is new, add a DNS A or CNAME record in AdGuard Home (LAN DNS) pointing to `10.10.1.11` (the Traefik host). For WAN-exposed services, also add a public DNS record at your DNS provider pointing to the public IP.
+
+    ```bash
+    # AdGuard Home custom rewrite (LAN)
+    # Navigate to Filters → DNS rewrites → Add rewrite
+    # Domain: my-service.chip.example.com
+    # Answer: 10.10.1.11
+    ```
+  </Step>
+</Steps>
+
+## Path-Based Routing
+
+For cases where multiple services must share a single hostname (for example, a unified API gateway), Traefik supports path-based routing rules using the `PathPrefix` matcher.
+
+```yaml
+labels:
+  - "traefik.http.routers.api-v1.rule=Host(`api.chip.example.com`) && PathPrefix(`/v1`)"
+  - "traefik.http.routers.api-v2.rule=Host(`api.chip.example.com`) && PathPrefix(`/v2`)"
+```
+
+<Note>
+Path-based routing is used sparingly in CHIP. Prefer hostname-based routing for new services — it is simpler to reason about, avoids prefix-stripping complexity, and produces cleaner service isolation. Path-based routing is reserved for services that explicitly require a shared hostname (e.g., unified mobile app APIs).
+</Note>
+
+## TLS Certificate Management
+
+Certificates are issued and renewed automatically by Traefik using the Let's Encrypt DNS-01 challenge against the Cloudflare API. The certificate store is persisted at `/opt/chip/config/proxy-ingress/traefik/acme/acme.json` (mode `0600`).
+
+<Accordion title="Checking certificate status">
+  To inspect the current certificate and its expiry date, use `openssl` against the live endpoint:
+
+  ```bash
+  echo | openssl s_client -connect grafana.chip.example.com:443 -servername grafana.chip.example.com 2>/dev/null \
+    | openssl x509 -noout -dates -subject
+  ```
+
+  To inspect the raw `acme.json` store (requires `jq`):
+
+  ```bash
+  sudo cat /opt/chip/config/proxy-ingress/traefik/acme/acme.json \
+    | jq '.letsencrypt.Certificates[] | {domain: .domain.main, expiry: .certificate}' 2>/dev/null
+  ```
+</Accordion>
+
+<Accordion title="Forcing certificate renewal">
+  Traefik renews certificates automatically 30 days before expiry. To force immediate renewal (for example after a domain change), remove the `acme.json` file and restart the Traefik container. Traefik will re-issue all certificates on startup.
+
+  ```bash
+  cd /opt/chip/stacks/proxy-ingress
+  sudo mv /opt/chip/config/proxy-ingress/traefik/acme/acme.json \
+          /opt/chip/config/proxy-ingress/traefik/acme/acme.json.bak
+  sudo docker compose restart traefik
+  sudo docker compose logs -f traefik | grep -i "acme\|certificate"
+  ```
+
+  <Warning>
+  Removing `acme.json` triggers fresh certificate requests for all configured domains simultaneously. Let's Encrypt rate limits apply (5 duplicate certificates per domain per week). Coordinate timing carefully and avoid doing this repeatedly in quick succession.
+  </Warning>
+</Accordion>
+
+## Traefik Access Logs
+
+Traefik is configured to write structured JSON access logs to `/opt/chip/data/proxy-ingress/traefik/access.log`. These are ingested by Promtail and forwarded to Loki for querying in Grafana.
+
+```yaml
+# traefik.yml — access log config
+accessLog:
+  filePath: /var/log/traefik/access.log
+  format: json
+  filters:
+    statusCodes:
+      - "400-599"
+  fields:
+    defaultMode: keep
+    names:
+      ClientUsername: drop
+    headers:
+      defaultMode: drop
+      names:
+        Authorization: drop
+        Cookie: drop
+```
+
+Only responses with status codes 400–599 are logged by default to reduce log volume. Temporarily enable full logging for a specific router during debugging by setting `filters.statusCodes` to include `200-299` in the dynamic configuration file.

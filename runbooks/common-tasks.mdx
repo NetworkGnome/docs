@@ -1,0 +1,487 @@
+---
+title: "Common Infrastructure Tasks and Operating Runbooks"
+sidebarTitle: "Common Tasks"
+description: "Step-by-step runbooks for the most frequently performed CHIP infrastructure operations, from service restarts to VLAN configuration."
+---
+
+This page collects the most frequently executed infrastructure runbooks in CHIP. Each task is presented as an expandable section containing prerequisites, numbered steps, and a verification procedure. Before executing any task, confirm you have an open change ticket if the operation affects a production service, and that you have the required access listed under each task's prerequisites. If your situation deviates from the documented steps, stop and consult the runbook owner before proceeding.
+
+<Note>
+  All tasks on this page assume you are authenticated to CHIP and have at minimum **Operator** role access. Tasks that require elevated privileges are called out explicitly in their prerequisites section.
+</Note>
+
+---
+
+## Infrastructure Task Runbooks
+
+<Accordion title="Runbook 1 — Restart a Docker Service">
+
+  Restarting a Docker service is one of the most common remediation steps for unhealthy or unresponsive containers. This runbook ensures you restart the correct service, confirm it recovers successfully, and investigate the root cause before closing your ticket.
+
+  **Prerequisites**
+
+  - SSH access to the Docker host running the service
+  - `sudo` or membership in the `docker` group on the target host
+  - The exact service or container name (verify in the CHIP inventory or via `docker ps`)
+  - Change ticket open if service is in production
+
+  <Steps>
+    <Step title="Identify the affected container">
+      SSH into the Docker host and list running containers to confirm the service name and current state.
+
+      ```bash
+      ssh operator@<docker-host>
+      docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
+      ```
+
+      Note the container name and its current `STATUS`. An `Exited` or `Unhealthy` status confirms the service needs attention.
+    </Step>
+    <Step title="Capture logs before restarting">
+      Collect the last 100 lines of container logs before restarting. This preserves the error context for root cause analysis.
+
+      ```bash
+      docker logs --tail 100 <container-name> > /tmp/<container-name>-pre-restart.log 2>&1
+      ```
+    </Step>
+    <Step title="Restart the container">
+      Restart the container using the Docker CLI. If the service is managed by Docker Compose or a Swarm stack, use the appropriate command.
+
+      ```bash
+      # Standalone container
+      docker restart <container-name>
+
+      # Docker Compose managed service (run from the stack directory)
+      docker compose restart <service-name>
+
+      # Docker Swarm service
+      docker service update --force <stack-name>_<service-name>
+      ```
+    </Step>
+    <Step title="Monitor the restart">
+      Stream container logs for at least 60 seconds to confirm the service starts cleanly without errors.
+
+      ```bash
+      docker logs -f --tail 50 <container-name>
+      ```
+
+      Press `Ctrl+C` once the service has stabilized.
+    </Step>
+    <Step title="Verify the service is healthy">
+      Confirm the container status returns to `Up` and that any defined health checks pass.
+
+      ```bash
+      docker inspect --format='{{.State.Status}} | Health: {{.State.Health.Status}}' <container-name>
+      ```
+
+      Expected output: `running | Health: healthy`
+    </Step>
+    <Step title="Record and escalate if repeat failure">
+      Upload the pre-restart log file to your change ticket. If the service required more than one restart within a 24-hour period, escalate to the Platform Ops on-call for root cause investigation. Do not close the ticket until the underlying cause is identified.
+    </Step>
+  </Steps>
+
+</Accordion>
+
+<Accordion title="Runbook 2 — Add a New VM to the Inventory">
+
+  When a new VM is provisioned in Proxmox, it must be registered in the CHIP inventory before it can be managed, monitored, or targeted by automation. This runbook covers the complete onboarding sequence from Proxmox through CHIP's inventory database.
+
+  **Prerequisites**
+
+  - The VM is fully provisioned and reachable via SSH in Proxmox
+  - You have **Admin** role access in CHIP
+  - The VM's intended hostname, IP address, VLAN, and service role are confirmed
+  - The VM's SSH host key fingerprint is available (from the Proxmox console)
+
+  <Steps>
+    <Step title="Verify the VM is reachable">
+      From your management workstation, ping the VM and confirm SSH connectivity before adding it to inventory.
+
+      ```bash
+      ping -c 4 <vm-ip>
+      ssh -o StrictHostKeyChecking=accept-new operator@<vm-ip> "hostname && uptime"
+      ```
+    </Step>
+    <Step title="Add the VM to the CHIP inventory">
+      Navigate to **Inventory → Hosts → Add Host** in the CHIP UI, or use the CLI:
+
+      ```bash
+      chip inventory add-host \
+        --hostname <hostname> \
+        --ip <vm-ip> \
+        --type vm \
+        --hypervisor <proxmox-node> \
+        --vlan <vlan-id> \
+        --role <service-role> \
+        --environment <prod|staging|dev>
+      ```
+    </Step>
+    <Step title="Apply baseline configuration">
+      Run the CHIP baseline playbook against the new host to apply standard configuration (NTP, logging agents, monitoring exporter, SSH hardening).
+
+      ```bash
+      chip run playbook baseline --host <hostname> --dry-run
+      # Review the plan, then apply
+      chip run playbook baseline --host <hostname>
+      ```
+    </Step>
+    <Step title="Assign the host to the correct host groups">
+      Add the VM to the appropriate host groups so it receives the correct automated policies.
+
+      ```bash
+      chip inventory group add <hostname> --groups platform,<environment>,<service-role>
+      ```
+    </Step>
+    <Step title="Verify monitoring is active">
+      In the CHIP dashboard, navigate to **Monitoring → Hosts** and confirm the new host appears with a green status within 5 minutes of completing the previous step.
+    </Step>
+    <Step title="Update the IPAM record">
+      Mark the IP address as allocated in the CHIP IPAM module and link it to the new host record.
+
+      ```bash
+      chip ipam assign --ip <vm-ip> --host <hostname> --note "Allocated via runbook on $(date)"
+      ```
+    </Step>
+    <Step title="Document in the change ticket">
+      Record the new host's CHIP host ID, assigned groups, and IPAM record number in your change ticket before closing.
+    </Step>
+  </Steps>
+
+</Accordion>
+
+<Accordion title="Runbook 3 — Update a DNS Record">
+
+  DNS changes are high-impact operations because incorrect records can make services unreachable or route traffic to the wrong host. This runbook enforces a verify-before-change approach with a mandatory propagation check.
+
+  **Prerequisites**
+
+  - **Network Ops** role or higher in CHIP
+  - The fully qualified domain name (FQDN), current record value, new record value, and TTL are confirmed
+  - Change ticket approved by the service owner
+  - If changing an A record for a production service, the change must be scheduled during low-traffic hours
+
+  <Steps>
+    <Step title="Query the current record">
+      Capture the current DNS state before making any change. Save this output to your change ticket as the rollback reference.
+
+      ```bash
+      dig +short <fqdn> A
+      dig +short <fqdn> CNAME
+      # Also query your authoritative nameserver directly
+      dig @<authoritative-ns> <fqdn> ANY
+      ```
+    </Step>
+    <Step title="Lower the TTL (if time permits)">
+      If the change can be planned in advance, lower the TTL to 300 seconds at least one full TTL cycle before making the record change. This minimizes the propagation window.
+
+      ```bash
+      chip dns update --fqdn <fqdn> --ttl 300
+      ```
+    </Step>
+    <Step title="Apply the DNS change">
+      Update the record using the CHIP DNS module.
+
+      ```bash
+      chip dns update \
+        --fqdn <fqdn> \
+        --type <A|CNAME|MX|TXT> \
+        --value "<new-value>" \
+        --ttl <ttl>
+      ```
+    </Step>
+    <Step title="Verify propagation">
+      Query multiple resolvers to confirm the change has propagated. Wait for the old TTL to expire if needed.
+
+      ```bash
+      # Check against your internal resolver
+      dig +short <fqdn>
+
+      # Check against a public resolver
+      dig @8.8.8.8 +short <fqdn>
+      dig @1.1.1.1 +short <fqdn>
+      ```
+
+      All resolvers should return the new value before you proceed.
+    </Step>
+    <Step title="Verify service connectivity">
+      If you changed an A record for a live service, confirm the service is reachable at the new address.
+
+      ```bash
+      curl -I https://<fqdn>
+      ```
+    </Step>
+    <Step title="Restore TTL to original value">
+      Once the change is confirmed stable, restore the TTL to its original value (typically 3600 seconds) to reduce resolver load.
+
+      ```bash
+      chip dns update --fqdn <fqdn> --ttl 3600
+      ```
+    </Step>
+  </Steps>
+
+</Accordion>
+
+<Accordion title="Runbook 4 — Rotate SSH Keys for an Operator">
+
+  SSH key rotation is required during operator offboarding, after a suspected key compromise, or as part of a scheduled security review. This runbook covers both removing the old key and confirming the operator can authenticate with the new key before the old one is revoked.
+
+  **Prerequisites**
+
+  - **Security** or **Admin** role in CHIP
+  - The operator's username and the list of hosts they currently have access to (pull from CHIP Access Management)
+  - If rotating due to compromise, the incident ticket number
+  - A new public key has been generated by the operator (or by you on their behalf) and is ready to deploy
+
+  <Warning>
+    Do **not** remove the old key until the new key is confirmed working on every target host. Removing the old key first can lock the operator out entirely if the new key deployment fails mid-way.
+  </Warning>
+
+  <Steps>
+    <Step title="Export the operator's current access list">
+      Pull the full list of hosts where the operator's key is currently authorized.
+
+      ```bash
+      chip access list-keys --user <username> --format table
+      ```
+
+      Save this list to your change ticket.
+    </Step>
+    <Step title="Stage the new public key in CHIP">
+      Add the new public key to the operator's CHIP profile. At this point, the old key is still active.
+
+      ```bash
+      chip access add-key \
+        --user <username> \
+        --key-file /path/to/<username>_new_key.pub \
+        --label "Rotated $(date +%Y-%m-%d)"
+      ```
+    </Step>
+    <Step title="Deploy the new key to all target hosts">
+      Push the new authorized_keys entry to every host in the operator's access list.
+
+      ```bash
+      chip access deploy-key \
+        --user <username> \
+        --key-label "Rotated $(date +%Y-%m-%d)" \
+        --all-assigned-hosts
+      ```
+    </Step>
+    <Step title="Verify new key authentication">
+      Ask the operator to confirm they can authenticate using the new key before you proceed with revocation.
+
+      ```bash
+      # Operator should run this on their workstation
+      ssh -i ~/.ssh/<new-private-key> operator@<sample-host> "echo 'New key works'"
+      ```
+
+      Do not proceed to the next step until the operator confirms success on at least two hosts.
+    </Step>
+    <Step title="Revoke the old key">
+      Remove the old public key from the operator's CHIP profile and propagate the removal to all hosts.
+
+      ```bash
+      chip access revoke-key \
+        --user <username> \
+        --key-label "<old-key-label>" \
+        --all-assigned-hosts
+      ```
+    </Step>
+    <Step title="Confirm the old key no longer works">
+      Attempt to authenticate with the old key. The connection should be refused.
+
+      ```bash
+      ssh -i ~/.ssh/<old-private-key> -o PasswordAuthentication=no operator@<sample-host>
+      # Expected: Permission denied (publickey)
+      ```
+    </Step>
+    <Step title="Update the incident or change ticket">
+      Record the rotation date, the key fingerprints (old and new), and the list of hosts updated. If rotating due to compromise, link to the security incident ticket.
+    </Step>
+  </Steps>
+
+</Accordion>
+
+<Accordion title="Runbook 5 — Deploy a New Docker Stack">
+
+  Deploying a new Docker stack introduces a new application workload to a Docker host or Swarm cluster. This runbook covers the deployment pipeline from image validation through live traffic confirmation.
+
+  **Prerequisites**
+
+  - **Platform Ops** role or higher in CHIP
+  - The Docker Compose or Stack file has been reviewed and approved in version control
+  - The container image is available in the CHIP-managed container registry
+  - Required secrets (passwords, API keys) are stored in CHIP Secrets and referenced in the Compose file — no plaintext secrets in the file
+  - DNS record for the service is pre-created (see DNS Update runbook)
+  - Change ticket approved
+
+  <Steps>
+    <Step title="Validate the stack file">
+      Run a syntax and configuration validation against the stack file before deploying.
+
+      ```bash
+      chip stack validate --file docker-compose.<stack-name>.yml
+      docker compose -f docker-compose.<stack-name>.yml config
+      ```
+
+      Fix any errors before continuing.
+    </Step>
+    <Step title="Pull and verify the container image">
+      Pull the image to the target host and verify the digest matches the approved version.
+
+      ```bash
+      docker pull <registry>/<image-name>:<tag>
+      docker inspect --format='{{.RepoDigests}}' <registry>/<image-name>:<tag>
+      ```
+
+      Compare the digest against the approved value recorded in your change ticket.
+    </Step>
+    <Step title="Deploy the stack">
+      Deploy using Docker Compose (single host) or Docker Swarm (cluster).
+
+      ```bash
+      # Single-host Docker Compose
+      docker compose -f docker-compose.<stack-name>.yml up -d
+
+      # Docker Swarm
+      docker stack deploy \
+        --compose-file docker-compose.<stack-name>.yml \
+        --with-registry-auth \
+        <stack-name>
+      ```
+    </Step>
+    <Step title="Monitor the startup sequence">
+      Watch container logs for at least 90 seconds to confirm the application starts cleanly.
+
+      ```bash
+      docker compose -f docker-compose.<stack-name>.yml logs -f
+      # or for Swarm
+      docker service logs -f <stack-name>_<service-name>
+      ```
+    </Step>
+    <Step title="Run smoke tests">
+      Execute the smoke test suite defined in CHIP for the new stack. At minimum, verify the health check endpoint responds.
+
+      ```bash
+      chip stack smoke-test --stack <stack-name>
+      # or manually:
+      curl -sf http://<service-host>:<port>/health | jq .
+      ```
+    </Step>
+    <Step title="Register the stack in CHIP">
+      Register the deployed stack in CHIP's service inventory so it appears in monitoring and the service catalog.
+
+      ```bash
+      chip services register \
+        --stack <stack-name> \
+        --host <docker-host> \
+        --environment <prod|staging|dev>
+      ```
+    </Step>
+    <Step title="Confirm monitoring dashboards are active">
+      In the CHIP dashboard, navigate to **Services → Stacks** and confirm the new stack appears with all containers in a healthy state.
+    </Step>
+  </Steps>
+
+</Accordion>
+
+<Accordion title="Runbook 6 — Add a VLAN to a Switch Port">
+
+  Adding a VLAN to a switch port is a common network segmentation task required when provisioning new hosts, expanding service zones, or onboarding new tenants. Incorrect VLAN configuration can silently break connectivity for other services sharing the port, so this runbook requires careful verification at each stage.
+
+  **Prerequisites**
+
+  - **Network Ops** role or higher in CHIP
+  - The target switch hostname/IP, port identifier (e.g. `GigabitEthernet0/12`), and the VLAN ID to be added
+  - The VLAN already exists on the switch (create it first if not — this runbook only covers adding it to a port)
+  - SSH access to the switch with a privileged account
+  - Change ticket approved
+
+  <Steps>
+    <Step title="Document the current port configuration">
+      Connect to the switch and capture the current port configuration before making any changes.
+
+      ```bash
+      ssh netops@<switch-hostname>
+      ```
+
+      ```
+      show running-config interface <port-identifier>
+      show interfaces <port-identifier> trunk
+      show interfaces <port-identifier> switchport
+      ```
+
+      Copy the output into your change ticket as the rollback reference.
+    </Step>
+    <Step title="Verify the VLAN exists on the switch">
+      Confirm the target VLAN is already defined before adding it to the port.
+
+      ```
+      show vlan id <vlan-id>
+      ```
+
+      If the VLAN does not appear in the output, stop and create it via the CHIP Network module before continuing.
+    </Step>
+    <Step title="Enter configuration mode and add the VLAN">
+      Apply the VLAN configuration to the port. The exact syntax varies by switch vendor.
+
+      ```bash
+      # Cisco IOS (access port — single VLAN, untagged)
+      configure terminal
+      interface <port-identifier>
+       switchport mode access
+       switchport access vlan <vlan-id>
+      end
+
+      # Cisco IOS (trunk port — add VLAN to allowed list)
+      configure terminal
+      interface <port-identifier>
+       switchport trunk allowed vlan add <vlan-id>
+      end
+      ```
+    </Step>
+    <Step title="Save the running configuration">
+      Write the change to the startup configuration so it persists across reboots.
+
+      ```
+      write memory
+      ```
+    </Step>
+    <Step title="Verify the VLAN is active on the port">
+      Confirm the VLAN now appears in the active port configuration.
+
+      ```
+      show interfaces <port-identifier> switchport
+      show vlan id <vlan-id>
+      ```
+
+      The VLAN ID should appear under `Active` VLANs for the port.
+    </Step>
+    <Step title="Test connectivity from the end device">
+      From the device connected to the port, confirm it receives a DHCP address in the new VLAN's subnet (if DHCP is configured) and can reach its default gateway.
+
+      ```bash
+      # On the end device
+      ip addr show
+      ping <vlan-gateway-ip>
+      ```
+    </Step>
+    <Step title="Update the CHIP network inventory">
+      Record the VLAN assignment in CHIP's network inventory.
+
+      ```bash
+      chip network port update \
+        --switch <switch-hostname> \
+        --port <port-identifier> \
+        --vlan <vlan-id> \
+        --mode <access|trunk>
+      ```
+    </Step>
+  </Steps>
+
+</Accordion>
+
+---
+
+<Tip>
+  If you encounter a situation not covered by an existing runbook — or if a runbook's steps do not match your current environment — stop the operation and escalate to the runbook owner before improvising. An undocumented workaround today becomes an undocumented dependency tomorrow.
+</Tip>

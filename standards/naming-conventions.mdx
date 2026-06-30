@@ -1,0 +1,217 @@
+---
+title: "Infrastructure Naming Conventions Across CHIP"
+sidebarTitle: "Naming Conventions"
+description: "Reference all naming standards used in CHIP: hostnames, VM IDs, Docker services, DNS records, VLANs, and automation file conventions."
+---
+
+Consistent naming is one of the highest-leverage standards you can enforce in an infrastructure platform. When every hostname, DNS record, and Docker service follows a predictable pattern, you can build automation that works across the entire estate without special cases. You can grep logs, trace network flows, and understand topology at a glance. CHIP naming conventions are not stylistic preferences — they are load-bearing infrastructure that automation depends on. Deviating from them breaks tooling, causes confusion in incidents, and creates technical debt that compounds over time.
+
+<Note>
+Naming consistency is critical for automation. CHIP's Ansible inventory, monitoring label selectors, and DNS automation all rely on predictable naming patterns. When you introduce a non-standard name, you create a gap that must be patched manually in multiple places.
+</Note>
+
+## Naming Convention Reference
+
+<Accordion title="Hostnames">
+
+### Format
+
+Hostnames follow the pattern: `<role>-<env>-<sequence>`
+
+| Segment | Description | Allowed Values |
+|---|---|---|
+| `role` | Functional role of the host (2–8 lowercase letters) | `pve`, `web`, `db`, `app`, `mon`, `gw`, `bkp`, `dns`, `nfs` |
+| `env` | Environment abbreviation | `prod`, `staging`, `dev`, `lab` |
+| `sequence` | Zero-padded two-digit sequence number | `01` through `99` |
+
+### Examples
+
+| ✅ Correct | ❌ Incorrect | Reason |
+|---|---|---|
+| `pve-prod-01` | `proxmox1` | Missing environment segment, no separator |
+| `db-dev-02` | `dev-database-2` | Role should come first; sequence not zero-padded |
+| `mon-prod-01` | `MonitoringServer` | Mixed case not allowed |
+| `gw-staging-01` | `staging_gw` | Use hyphens, not underscores; role must come first |
+| `web-prod-03` | `web-production-3` | Use abbreviated environment (`prod` not `production`) |
+
+### Special Cases
+
+- **Cluster nodes** — When multiple hosts form a cluster, the sequence number indicates cluster membership order (e.g., `pve-prod-01`, `pve-prod-02`, `pve-prod-03`).
+- **Lab hosts** — Lab hosts use `lab` as the environment segment and are explicitly excluded from production monitoring and automation.
+- **Temporary hosts** — Temporary or ephemeral hosts use the suffix `-tmp` appended after the sequence: `web-dev-01-tmp`. These are never added to production inventory.
+
+</Accordion>
+
+<Accordion title="VM and Container IDs (Proxmox)">
+
+### Proxmox VMID Ranges
+
+Proxmox VM and container IDs are assigned from environment-specific ranges to make it immediately clear which environment a given VM belongs to when viewing Proxmox directly.
+
+| Environment | VM ID Range | Container (LXC) Range | Notes |
+|---|---|---|---|
+| Production | `1000–1999` | `2000–2999` | Reserved for production workloads only |
+| Staging | `3000–3999` | `4000–4999` | Mirrors production topology |
+| Development | `5000–5999` | `6000–6999` | Freely allocated by engineers |
+| Lab / Experimental | `7000–7999` | `8000–8999` | Not backed up; may be destroyed without notice |
+| Templates | `9000–9099` | `9100–9199` | Read-only; used as clone sources |
+
+### Examples
+
+| VM ID | Interpretation |
+|---|---|
+| `1042` | Production VM #42 |
+| `2015` | Production LXC container #15 |
+| `3001` | Staging VM #1 |
+| `9005` | VM template #5 |
+
+### Assignment Rules
+
+- IDs are assigned sequentially within the range. Do not reuse IDs from decommissioned VMs within the same calendar year.
+- New VM IDs are recorded in `infrastructure/vm-registry.yml` in the CHIP repository before the VM is created.
+- Templates are never cloned directly to production — they are always cloned to staging first for validation.
+
+</Accordion>
+
+<Accordion title="Docker Services and Stacks">
+
+### Service Names
+
+Docker service and container names use lowercase, hyphen-separated identifiers. They must be descriptive enough to identify the application and instance without context.
+
+**Format:** `<app>[-<component>][-<instance>]`
+
+| ✅ Correct | ❌ Incorrect | Reason |
+|---|---|---|
+| `prometheus` | `Prometheus` | Mixed case not permitted |
+| `grafana` | `grafana_server` | Use hyphens, not underscores |
+| `postgres-primary` | `primaryDB` | Must be lowercase, hyphen-separated |
+| `nginx-proxy` | `nginx_proxy_01` | No underscores; omit sequence if only one instance |
+| `alertmanager` | `alert-manager-service` | Avoid redundant suffixes like `-service` |
+
+### Stack Names
+
+Docker Compose stacks (used with Docker Swarm or `docker compose --project-name`) follow the pattern: `<domain>-<env>`
+
+| ✅ Correct | ❌ Incorrect |
+|---|---|
+| `monitoring-prod` | `MonitoringProd` |
+| `data-staging` | `data_staging` |
+| `web-dev` | `web-development-stack` |
+
+### Volume and Network Names
+
+Docker volumes and networks are prefixed with the stack name to avoid collisions across stacks:
+
+```
+monitoring-prod_grafana_data
+monitoring-prod_prometheus_data
+monitoring-prod_backend
+```
+
+</Accordion>
+
+<Accordion title="DNS Records">
+
+### Subdomain Patterns
+
+DNS records in CHIP use consistent subdomain patterns that communicate the purpose of each endpoint. The `chip.internal` zone is used for internal services; public-facing services use the registered domain.
+
+| Pattern | Use Case | Example |
+|---|---|---|
+| `<service>.chip.internal` | Internal service endpoint | `grafana.chip.internal` |
+| `<host>.hosts.chip.internal` | Direct host resolution | `pve-prod-01.hosts.chip.internal` |
+| `<service>-<env>.chip.internal` | Environment-scoped service | `api-staging.chip.internal` |
+| `<role>-<n>.chip.internal` | Load-balanced role alias | `db-1.chip.internal` |
+| `*.chip.internal` | Wildcard for catch-all routing | Used by the ingress proxy |
+
+### PTR Records (Reverse DNS)
+
+Every host in the production and staging inventory must have a PTR record that resolves to the canonical FQDN. PTR records are managed by the `dns` Ansible role and applied automatically when a host is added to inventory.
+
+### Record Naming Rules
+
+- Use lowercase only in DNS records. DNS is case-insensitive, but lowercase avoids comparison bugs in tooling.
+- Do not use underscores in DNS hostnames. Underscores are not valid in DNS labels (though they may work in some resolvers). Use hyphens.
+- Do not create records that point to IP addresses directly without an associated hostname entry. All IPs in use must have both an A record and a PTR record.
+
+</Accordion>
+
+<Accordion title="VLANs">
+
+### VLAN Name Format
+
+VLAN names follow the pattern: `<function>-<env>` where `function` describes the network's role and `env` is the environment.
+
+| Function | Description |
+|---|---|
+| `mgmt` | Out-of-band management (IPMI, iDRAC, switch management) |
+| `compute` | VM and container workload traffic |
+| `storage` | Storage replication and NFS/iSCSI traffic |
+| `services` | Internal service mesh traffic |
+| `external` | Untrusted external-facing traffic |
+| `dmz` | Demilitarized zone for edge services |
+
+### VLAN ID Allocation Ranges
+
+| Range | Environment / Purpose | Examples |
+|---|---|---|
+| `1–9` | Reserved (do not use) | VLAN 1 (native) |
+| `10–99` | Management networks | `10` = mgmt-prod, `11` = mgmt-staging |
+| `100–199` | Production workloads | `100` = compute-prod, `110` = storage-prod |
+| `200–299` | Staging workloads | `200` = compute-staging, `210` = storage-staging |
+| `300–399` | Development workloads | `300` = compute-dev |
+| `400–499` | Services and internal routing | `400` = services-prod |
+| `500–599` | External and DMZ | `500` = external, `510` = dmz-prod |
+
+### Examples
+
+| ✅ Correct Name | VLAN ID | ❌ Incorrect Name |
+|---|---|---|
+| `mgmt-prod` | 10 | `Management` |
+| `compute-prod` | 100 | `prod_vlan` |
+| `storage-staging` | 210 | `SAN-staging-network` |
+| `dmz-prod` | 510 | `DMZ` |
+
+</Accordion>
+
+<Accordion title="Automation Repository Files and Directories">
+
+### File and Directory Naming
+
+All files and directories in the `automation/` repository use lowercase, hyphen-separated names. No spaces, no underscores, no mixed case.
+
+| ✅ Correct | ❌ Incorrect |
+|---|---|
+| `playbooks/update-docker.yml` | `playbooks/UpdateDocker.yml` |
+| `roles/docker-baseline/` | `roles/docker_baseline/` |
+| `inventory/production/hosts.yml` | `inventory/Production/Hosts.yml` |
+| `scripts/bash/cert-check.sh` | `scripts/bash/cert_check.sh` |
+
+### Ansible Role Names
+
+Ansible roles use lowercase, hyphen-separated names that describe their primary function. Avoid generic names like `common` unless the role truly applies cross-cutting concerns to all hosts.
+
+| ✅ Correct | ❌ Incorrect |
+|---|---|
+| `docker-baseline` | `Docker` |
+| `nginx-reverse-proxy` | `nginx_proxy` |
+| `backup-agent` | `backupAgent` |
+
+### Variable Names in Ansible
+
+Ansible variables use lowercase with underscores (`snake_case`). Prefix variables with the role name to prevent collisions:
+
+```yaml
+# Good
+docker_daemon_log_driver: "json-file"
+nginx_worker_processes: 4
+backup_retention_days: 30
+
+# Bad
+LogDriver: "json-file"
+workerProcesses: 4
+retention: 30
+```
+
+</Accordion>

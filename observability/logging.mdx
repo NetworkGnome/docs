@@ -1,0 +1,203 @@
+---
+title: "Log Aggregation and Search in CHIP"
+sidebarTitle: "Logging"
+description: "Explore CHIP's centralized log aggregation pipeline built on Loki. Learn log sources, retention policies, LogQL query patterns, and log-based alerting."
+---
+
+CHIP centralizes logs from every layer of your infrastructure into a single, queryable platform powered by [Grafana Loki](https://grafana.com/oss/loki/). Unlike traditional full-text search engines that index every word, Loki stores logs as compressed streams indexed only by labels, which dramatically reduces storage costs while keeping query performance fast for label-filtered searches. Every log line is enriched with standard labels — `env`, `host`, `app`, `level` — before ingestion, giving you a consistent query vocabulary regardless of the underlying log source.
+
+## Log Sources
+
+CHIP collects logs from the following sources. Each source is configured to forward to the Loki ingestion endpoint via a dedicated agent or shipper.
+
+| Source | Transport Agent | Loki Stream Label | Retention |
+|---|---|---|---|
+| Linux syslog / journald | Promtail (systemd journal reader) | `{job="syslog", host="<hostname>"}` | 90 days |
+| Docker container stdout/stderr | Promtail (Docker service discovery) | `{job="docker", container="<name>"}` | 90 days |
+| Kubernetes pod logs | Promtail (DaemonSet) | `{job="k8s", namespace="<ns>", pod="<pod>"}` | 90 days |
+| Application structured logs | Promtail file-based scrape | `{job="app", app="<name>", env="<env>"}` | 90 days |
+| Audit logs (sudo, SSH, OS) | Promtail + auditd plugin | `{job="audit", host="<hostname>"}` | 365 days |
+| Firewall / network ACL logs | Syslog-NG → Promtail | `{job="firewall", device="<hostname>"}` | 180 days |
+| CHIP control plane logs | Promtail (internal) | `{job="chip-platform", component="<svc>"}` | 365 days |
+
+<Info>
+Audit logs and CHIP control-plane logs are retained for 365 days to satisfy compliance requirements. All other log streams follow the standard 90-day retention. Retention periods can be reviewed in **Settings → Observability → Loki → Retention**.
+</Info>
+
+### Log Ingestion Pipeline
+
+```
+Log Source
+    │
+    ▼
+Promtail Agent        ← file tailing, journald, Docker SD, K8s SD
+    │  label enrichment (env, host, app, level)
+    │  pipeline stages (JSON parsing, regex extraction, drop noisy lines)
+    ▼
+Loki Distributor      ← HTTP push (gRPC), load-balanced
+    │
+    ▼
+Loki Ingester         ← WAL, in-memory chunks
+    │
+    ▼
+Object Storage (S3 / MinIO)   ← compressed chunks, 90–365 day retention
+    │
+    ▼
+Grafana Explore / Loki API    ← LogQL queries, dashboards, alert rules
+```
+
+## Accessing the Log UI
+
+<Steps>
+  <Step title="Open Grafana Explore">
+    Navigate to `https://grafana.<your-chip-domain>` and log in with your CHIP credentials. Click the **Explore** icon (compass) in the left sidebar.
+  </Step>
+  <Step title="Select the Loki data source">
+    In the data source dropdown at the top of the Explore page, select **Loki**. If you do not see Loki in the list, contact your CHIP platform administrator to confirm your Grafana role includes data-source access.
+  </Step>
+  <Step title="Choose your query mode">
+    Switch between **Builder** mode (visual label picker) and **Code** mode (raw LogQL) using the toggle to the right of the query bar. Builder mode is recommended for initial exploration; switch to Code mode for complex filtering and metric queries.
+  </Step>
+  <Step title="Enter a log stream selector">
+    In Builder mode, select the `job` label to narrow the log source, then optionally add additional labels (e.g., `env=prod`, `host=web-01`). Click **Run Query** or press `Shift+Enter`.
+  </Step>
+  <Step title="Review and refine results">
+    Log lines appear in the results panel with timestamps and labels. Use the **Filter** bar to add inline label filters or text filters without rewriting the query. Adjust the time range picker to zoom in on the relevant window.
+  </Step>
+</Steps>
+
+<Tip>
+Pin frequently used log queries as dashboard panels or bookmark them using Grafana's **Explore → Copy link** feature. Sharing a bookmarked Explore link with a colleague preserves your exact query, time range, and data source selection.
+</Tip>
+
+## Querying Logs with LogQL
+
+[LogQL](https://grafana.com/docs/loki/latest/query/) is Loki's query language. Queries start with a **log stream selector** in curly braces, optionally followed by a **filter expression** and a **metric query**.
+
+### Basic Log Stream Selector
+
+```logql
+# All logs from production application servers
+{job="app", env="prod"}
+
+# All syslog lines from a specific host
+{job="syslog", host="worker-03.internal"}
+
+# All Kubernetes logs in the kube-system namespace
+{job="k8s", namespace="kube-system"}
+```
+
+### Filtering by Content
+
+```logql
+# Find all error-level lines from the API service
+{job="app", app="api-gateway"} |= "error"
+
+# Case-insensitive search across all app logs
+{job="app", env="prod"} |~ "(?i)(error|exception|panic)"
+
+# Exclude health-check noise from access logs
+{job="app", app="nginx"} |= "GET" != "/healthz"
+```
+
+### JSON Parsing and Field Extraction
+
+```logql
+# Parse JSON structured logs and filter by extracted field
+{job="app", app="payment-service"}
+  | json
+  | level="error"
+  | duration_ms > 2000
+
+# Extract HTTP status codes and filter for 5xx responses
+{job="app", app="api-gateway"}
+  | json
+  | status >= 500
+  | line_format "{{.method}} {{.path}} → {{.status}} ({{.duration_ms}}ms)"
+```
+
+### Metric Queries (Log-Derived Metrics)
+
+```logql
+# Error rate per minute over the last hour, grouped by app
+sum by (app) (
+  rate({job="app", env="prod"} |= "error" [1m])
+)
+
+# Count of SSH login attempts per host over the last 24 hours
+sum by (host) (
+  count_over_time({job="audit"} |= "sshd" |= "Accepted" [24h])
+)
+```
+
+### Common Query Recipes
+
+<Accordion title="Find all errors in the last hour across all production apps">
+```logql
+{job="app", env="prod"} |~ "(?i)(error|exception|fatal|panic)" | logfmt | level="error"
+```
+</Accordion>
+
+<Accordion title="Find failed sudo commands in audit logs">
+```logql
+{job="audit"} |= "sudo" |= "authentication failure"
+| regexp `user=(?P<user>\S+)` 
+| line_format "User {{.user}} failed sudo on {{.host}}"
+```
+</Accordion>
+
+<Accordion title="Filter logs for a specific Kubernetes pod">
+```logql
+{job="k8s", namespace="production", pod=~"api-gateway-.*"}
+| json
+| level!="info"
+```
+</Accordion>
+
+<Accordion title="Trace a specific request ID across all services">
+```logql
+{job="app", env="prod"} |= "req-id=abc123def456"
+```
+</Accordion>
+
+<Accordion title="Show recent failed SSH authentication attempts">
+```logql
+{job="syslog"} |= "sshd" |= "Failed password"
+| regexp `from (?P<src_ip>\d+\.\d+\.\d+\.\d+)`
+| line_format "Failed SSH from {{.src_ip}} on {{.host}}"
+```
+</Accordion>
+
+## Log Retention Policy
+
+| Category | Retention | Justification |
+|---|---|---|
+| Application & system logs | 90 days | Operational debugging window |
+| Firewall / network ACL logs | 180 days | Security incident investigation |
+| Audit logs (sudo, SSH, OS changes) | 365 days | Compliance (SOC 2, internal policy) |
+| CHIP control-plane logs | 365 days | Change audit trail |
+
+<Warning>
+Log data is not deleted on a rolling daily basis — retention is enforced via Loki's `compactor` job which runs nightly. Logs ingested near a retention boundary may persist up to 24 hours beyond the nominal retention period. Do not rely on log deletion as a data-erasure mechanism; use the CHIP data removal request process for compliance-related erasure.
+</Warning>
+
+## Log-Based Alerting
+
+Loki integrates with Grafana Alerting, allowing you to fire alerts based on log content — useful for events that do not produce Prometheus metrics (e.g., specific error strings, security events in audit logs).
+
+To create a log-based alert rule:
+
+1. In Grafana, navigate to **Alerting → Alert Rules → New Alert Rule**.
+2. Select **Loki** as the data source.
+3. Enter a LogQL metric query (you must use a query that returns a numeric value, such as `count_over_time` or `rate`).
+4. Configure thresholds, labels (`severity`, `team`), and annotations (`runbook_url`) exactly as you would for a Prometheus rule.
+5. Alertmanager handles routing and notification in the same way as metric-based alerts.
+
+```logql
+# Example: Alert if more than 10 authentication failures occur in 5 minutes on any host
+sum by (host) (
+  count_over_time({job="audit"} |= "authentication failure" [5m])
+) > 10
+```
+
+For full details on configuring alert rules, thresholds, and notification routing, see the [Alerting](/observability/alerting) documentation.

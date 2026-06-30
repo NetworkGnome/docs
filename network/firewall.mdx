@@ -1,0 +1,286 @@
+---
+title: "Firewall Architecture and Rule Management in CHIP"
+sidebarTitle: "Firewall"
+description: "Learn CHIP's firewall zones, default-deny posture, rule ordering, logging policy, and how to request or review firewall rule changes."
+---
+
+CHIP's firewall infrastructure enforces network segmentation at every boundary in the platform — from the edge where your traffic meets the public internet, to the inter-VLAN boundaries between internal segments, down to host-level policy applied by the platform's distributed enforcement layer. Every packet that crosses a zone boundary is subject to stateful inspection, and the platform's default posture is to deny traffic unless an explicit rule permits it.
+
+## Architecture Overview
+
+CHIP uses a layered firewall model with three distinct enforcement points:
+
+<CardGroup cols={3}>
+  <Card title="Edge Firewall" icon="shield-halved">
+    Sits at the perimeter between the public internet and the platform's DMZ. Handles WAN ingress, egress filtering, and NAT for outbound traffic. Enforced by dedicated hardware appliances in an active/passive HA pair.
+  </Card>
+  <Card title="Inter-VLAN Firewall" icon="network-wired">
+    Controls traffic flowing between internal VLANs. Enforced at the Layer 3 core switching tier. All inter-VLAN routing is policy-controlled — no VLAN can reach another by default.
+  </Card>
+  <Card title="Host Firewall" icon="computer">
+    Per-host policy applied by CHIP's agent on each managed workload. Provides a final enforcement layer for east-west traffic within a VLAN segment, covering intra-VLAN service-to-service communication.
+  </Card>
+</CardGroup>
+
+### Stateful Inspection
+
+All three enforcement layers operate in stateful mode. The firewall tracks the state of each connection — `NEW`, `ESTABLISHED`, `RELATED`, `INVALID` — and automatically permits return traffic for connections that were explicitly allowed in the forward direction. You only need to write rules for the initiating direction; you do not need a separate rule to permit reply packets.
+
+---
+
+## Firewall Zones
+
+Each VLAN maps to exactly one firewall zone. Zones have an assigned trust level that governs default inter-zone behavior:
+
+| Zone | VLAN(s) | Trust Level | Description |
+|---|---|---|---|
+| `WAN` | — | Untrusted | Public internet. All traffic denied inbound by default. |
+| `DMZ` | VLAN 5 | Low | Public-facing services: load balancers, reverse proxies. |
+| `MGMT` | VLAN 10 | High | Out-of-band management: IPMI, iDRAC, network device management. |
+| `INFRA` | VLAN 20 | High | Platform infrastructure: hypervisors, storage, DNS, NTP. |
+| `DEV` | VLAN 50 | Medium | Development workloads. |
+| `STAGING` | VLAN 75 | Medium | Staging workloads. |
+| `PROD` | VLAN 100 | Medium | Production application workloads. |
+| `BACKUP` | VLAN 110 | High | Backup and replication traffic. |
+
+<Info>
+  Trust level does not automatically grant access between zones of the same level. Every inter-zone flow requires an explicit permit rule regardless of trust level. Trust level governs the *default-deny disposition* for unsolicited traffic — high-trust zones are more likely to be permitted as a destination by platform-wide service rules, but never as a source without explicit policy.
+</Info>
+
+### Default Deny Posture
+
+CHIP's inter-VLAN firewall operates with an implicit deny-all rule at the bottom of every zone pair's rule chain. This means:
+
+- A new VLAN has **zero** connectivity to any other VLAN until rules are added.
+- Removing a permit rule immediately blocks the corresponding traffic.
+- There are no "allow similar" heuristics — rules are exact.
+
+<Warning>
+  Do not modify or remove the implicit deny rules at the bottom of any zone chain. These are automatically managed by CHIP and are re-applied on every policy commit. Any manual modification will be overwritten and an audit alert will be raised. If you believe the default-deny baseline is too restrictive for a specific use case, open a firewall rule change request rather than attempting to alter the deny rules directly.
+</Warning>
+
+---
+
+## Rule Ordering Philosophy
+
+Rules within a zone-pair chain are evaluated top-to-bottom and the first matching rule wins. CHIP enforces the following ordering convention:
+
+1. **Explicit deny rules** for known-bad patterns (e.g., spoofed source IPs, blocked AS paths at the edge).
+2. **Established/related return traffic** permit rules (applied automatically by the platform; do not duplicate these).
+3. **Specific service permit rules** ordered from most specific to least specific.
+4. **Broad permit rules** (e.g., "allow all INFRA→PROD on TCP 443") placed after narrow rules.
+5. **Implicit deny-all** — the platform-managed final rule.
+
+<Tip>
+  When writing permit rules, always be as specific as possible on source, destination, protocol, and port. A rule that permits `INFRA → PROD on TCP 5432` is far safer than one that permits `INFRA → PROD on TCP any`, even if the current intent is only PostgreSQL. Overly broad rules create audit findings and require justification during quarterly reviews.
+</Tip>
+
+---
+
+## Firewall Rule Reference
+
+The table below documents the active platform-level rules that CHIP ships with. Environment-specific rules added by your team are visible in the CHIP portal under **Network → Firewall → Rule Explorer**.
+
+| Rule # | Source Zone | Destination Zone | Protocol / Port | Action | Description |
+|---|---|---|---|---|---|
+| 100 | `WAN` | `DMZ` | TCP / 443 | PERMIT | HTTPS ingress to load balancers |
+| 101 | `WAN` | `DMZ` | TCP / 80 | PERMIT | HTTP ingress (redirect to HTTPS) |
+| 200 | `DMZ` | `PROD` | TCP / 8080–8090 | PERMIT | LB to app tier backend pool |
+| 201 | `DMZ` | `PROD` | TCP / 443 | PERMIT | LB to app tier HTTPS backends |
+| 300 | `PROD` | `INFRA` | TCP+UDP / 53 | PERMIT | Production DNS resolution |
+| 301 | `PROD` | `INFRA` | UDP / 123 | PERMIT | Production NTP sync |
+| 302 | `PROD` | `INFRA` | TCP / 5432 | PERMIT | Production → database tier |
+| 400 | `STAGING` | `INFRA` | TCP+UDP / 53 | PERMIT | Staging DNS resolution |
+| 401 | `STAGING` | `INFRA` | UDP / 123 | PERMIT | Staging NTP sync |
+| 500 | `DEV` | `INFRA` | TCP+UDP / 53 | PERMIT | Dev DNS resolution |
+| 501 | `DEV` | `INFRA` | UDP / 123 | PERMIT | Dev NTP sync |
+| 600 | `MGMT` | `ANY` | TCP / 22 | PERMIT | SSH from management zone to all |
+| 601 | `MGMT` | `ANY` | TCP / 443 | PERMIT | HTTPS management API access |
+| 700 | `INFRA` | `BACKUP` | TCP / 9100 | PERMIT | Backup agent data transfer |
+| 701 | `BACKUP` | `INFRA` | TCP / 9100 | PERMIT | Backup controller to agents |
+| 800 | `PROD` | `WAN` | TCP / 443 | PERMIT | Production egress for external APIs |
+| 801 | `PROD` | `WAN` | TCP / 80 | PERMIT | Production egress HTTP (package mirrors) |
+| 999 | `ANY` | `ANY` | ANY | DENY | Implicit deny-all (platform-managed) |
+
+---
+
+## Common Rule Patterns
+
+<Tabs>
+  <Tab title="Inbound Rules">
+    Inbound rules control traffic entering a zone, most commonly from `WAN` into `DMZ` or from `DMZ` into application zones. When defining inbound rules, always specify:
+
+    - The most restrictive source (prefer a specific IP range over `ANY`)
+    - An exact destination address or address group, not `ANY`
+    - The specific protocol and port — never `ANY/ANY`
+
+    **WAN → DMZ HTTPS ingress:**
+    ```text
+    Source:      WAN (any)
+    Destination: dmz-lb-vip (172.16.5.10)
+    Protocol:    TCP
+    Port:        443
+    Action:      PERMIT
+    Log:         YES
+    ```
+
+    **DMZ → PROD application backend:**
+    ```text
+    Source:      dmz-lb-pool (172.16.5.0/28)
+    Destination: prod-app-tier (172.16.100.32/27)
+    Protocol:    TCP
+    Port:        8080-8090
+    Action:      PERMIT
+    Log:         YES (sampled at 1:10 in steady state)
+    ```
+
+    **Blocking an abusive source at the edge:**
+    ```text
+    Source:      203.0.113.0/24   ; example abusive range
+    Destination: ANY
+    Protocol:    ANY
+    Port:        ANY
+    Action:      DENY
+    Log:         YES
+    Position:    Top of WAN→DMZ chain (before permit rules)
+    ```
+  </Tab>
+  <Tab title="Outbound Rules">
+    Outbound rules govern egress from internal zones toward `WAN` or from higher-trust zones toward lower-trust zones. CHIP applies egress filtering to prevent data exfiltration and to ensure workloads only communicate with authorized external services.
+
+    **PROD → WAN for external API access:**
+    ```text
+    Source:      prod-app-tier (172.16.100.32/27)
+    Destination: WAN (any)
+    Protocol:    TCP
+    Port:        443
+    Action:      PERMIT
+    Log:         YES
+    Note:        Combined with DNS RPZ to block known-bad domains
+    ```
+
+    **DEV → WAN restricted to package mirrors only:**
+    ```text
+    Source:      dev-workloads (172.16.50.0/24)
+    Destination: mirror.chiodo.internal (proxy egress)
+    Protocol:    TCP
+    Port:        80, 443
+    Action:      PERMIT
+    Log:         YES
+    Note:        Dev does not get direct WAN egress; traffic is proxied
+    ```
+
+    **Blocking PROD → DEV lateral movement:**
+    ```text
+    Source:      prod-app-tier (172.16.100.0/24)
+    Destination: DEV zone (172.16.50.0/24)
+    Protocol:    ANY
+    Port:        ANY
+    Action:      DENY
+    Log:         YES
+    Note:        Placed explicitly above implicit deny for audit clarity
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Logging Policy
+
+CHIP's firewall logging is designed to balance full auditability with storage efficiency:
+
+<AccordionGroup>
+  <Accordion title="What is always logged">
+    - All **DENY** actions across every zone pair — these are written in full to the security event stream.
+    - All **PERMIT** actions on WAN ingress and WAN egress rules.
+    - All actions (PERMIT and DENY) on `MGMT` zone rules.
+    - New connection establishment (`NEW` state) for PROD → any and any → PROD flows.
+  </Accordion>
+  <Accordion title="What is sampled">
+    High-volume steady-state flows between internal zones — such as PROD → INFRA DNS (TCP/UDP 53) and NTP (UDP 123) — are sampled at a 1:100 rate to reduce log volume. Sampling is applied only after the connection rate for a given rule exceeds 1,000 connections per minute.
+  </Accordion>
+  <Accordion title="What is not logged">
+    Established/related return-traffic flows are not individually logged because they are implicit continuations of already-logged initiating connections. ICMP echo-reply within the same zone is suppressed.
+  </Accordion>
+  <Accordion title="Log retention">
+    - Security event stream (all DENY + privileged PERMIT): **365 days**, immutable.
+    - Full connection logs (sampled internal flows): **90 days**, queryable via the CHIP portal under **Observability → Firewall Logs**.
+    - WAN ingress/egress full logs: **180 days**.
+  </Accordion>
+</AccordionGroup>
+
+Firewall logs are queryable in real time from the CHIP portal or via the CLI:
+
+```bash
+# Show recent DENY events across all zones
+chip firewall logs --action DENY --limit 50
+
+# Show all traffic from a specific source in the last hour
+chip firewall logs --src 172.16.50.42 --since 1h
+
+# Show traffic to a specific destination port
+chip firewall logs --dst-port 5432 --zone-pair PROD:INFRA --since 24h
+```
+
+---
+
+## Requesting a Firewall Rule Change
+
+All firewall rule additions, modifications, and deletions must go through a formal change request. Ad-hoc changes applied directly to firewall devices are prohibited and will trigger a compliance alert.
+
+<Note>
+  Before submitting a production firewall rule change request, you should validate the rule in the staging environment. CHIP's staging firewall mirrors the production rule set and can be updated independently for testing. Use the CHIP portal under **Network → Firewall → Staging Rules** or the `--env staging` CLI flag. Rule changes that have not been validated in staging require a mandatory additional review step and a second approver.
+</Note>
+
+<Steps>
+  <Step title="Document the business justification">
+    Write a clear, concise description of why the rule is needed. Include: the service or workload that requires the new connectivity, the source and destination (specific IPs or CIDR blocks preferred over zone-wide), the protocol and port, and the expected traffic volume.
+  </Step>
+  <Step title="Validate in staging">
+    Apply the proposed rule to the staging firewall and confirm that the target service behaves correctly. Capture the test results — a successful `curl`, `nc`, or application-level health check output is sufficient.
+
+    ```bash
+    # Apply to staging for testing
+    chip firewall rule add \
+      --env staging \
+      --src-zone PROD \
+      --dst-zone INFRA \
+      --src 172.16.100.32/27 \
+      --dst 172.16.20.60 \
+      --proto tcp \
+      --port 6379 \
+      --action permit \
+      --description "prod app tier to Redis cache"
+
+    # Test connectivity from a staging workload
+    nc -zv 172.16.20.60 6379
+    ```
+  </Step>
+  <Step title="Submit the change request">
+    Open a change request in the CHIP portal under **Network → Firewall → Request Rule Change**. Attach your staging test results and fill in all required fields. The request is automatically routed to the network security team for review.
+
+    Alternatively, submit via the CLI and obtain a change request ID:
+
+    ```bash
+    chip firewall change-request create \
+      --rule-file ./proposed-rule.yaml \
+      --justification "Redis cache access for payment service" \
+      --staging-test-id stg-test-20250115-4821
+    ```
+  </Step>
+  <Step title="Await approval">
+    Standard rule changes (new permit rules between internal zones) require **one approver** from the network security team and typically complete within one business day. Changes involving `WAN`, `DMZ`, or `MGMT` zones require **two approvers** and a change advisory board window.
+  </Step>
+  <Step title="Monitor after deployment">
+    Once approved and deployed, monitor the CHIP firewall log stream for 30 minutes to confirm traffic is being permitted as expected and no unintended flows are appearing. The CHIP portal will display a banner on the rule indicating it is newly deployed for 24 hours.
+
+    ```bash
+    # Watch live log stream for the new rule
+    chip firewall logs --rule-id fw-rule-20250115-0093 --follow
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+  Never request a rule change that weakens or circumvents the default-deny baseline as a workaround for a misconfigured application. If an application cannot operate under CHIP's segmentation policy, the correct resolution is to fix the application's networking configuration or to design an explicit, narrowly scoped permit rule — not to create broad "allow all" rules. Broad rules will be rejected during review and flagged for security follow-up.
+</Warning>

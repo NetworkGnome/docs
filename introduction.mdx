@@ -1,0 +1,64 @@
+---
+title: "CHIP: Chiodo Infrastructure Platform"
+sidebarTitle: "Introduction"
+description: "CHIP is the single source of truth for hybrid infrastructure design, operational procedures, and platform governance across network, compute, and services."
+---
+
+CHIP (Chiodo Infrastructure Platform) is an enterprise infrastructure operations platform that unifies documentation, management, and operational procedures for modern hybrid infrastructure. Whether you're navigating network topology, managing Proxmox virtualization clusters, operating Docker-based services, or executing disaster recovery procedures, CHIP serves as the authoritative reference for every layer of the stack.
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/platform/architecture">
+    Understand the platform's overall design and component relationships
+  </Card>
+  <Card title="Inventory" icon="server" href="/platform/inventory">
+    Browse the full hardware and service inventory
+  </Card>
+  <Card title="Network" icon="network-wired" href="/network/overview">
+    Explore network topology, VLANs, DNS, and firewall rules
+  </Card>
+  <Card title="Compute" icon="microchip" href="/compute/proxmox">
+    Manage Proxmox virtualization, VMs, and storage
+  </Card>
+  <Card title="Services" icon="docker" href="/services/docker">
+    Docker environments, service stacks, and ingress routing
+  </Card>
+  <Card title="Observability" icon="chart-line" href="/observability/monitoring">
+    Monitoring dashboards, alerting, and centralized logging
+  </Card>
+  <Card title="Security" icon="shield-halved" href="/security/overview">
+    Access control, TLS certificates, and security posture
+  </Card>
+  <Card title="Operations" icon="book-open" href="/runbooks/overview">
+    Runbooks, disaster recovery, automation, and engineering standards
+  </Card>
+</CardGroup>
+
+## What CHIP Covers
+
+CHIP is organized into two major areas:
+
+**Platform** — the reference documentation for infrastructure design and configuration:
+- **Network**: VLAN design, DNS zones, firewall policy, and routing topology
+- **Compute**: Proxmox hypervisor configuration, VM and LXC management, and storage architecture
+- **Services**: Docker runtime environments, service stack catalog, and ingress/reverse proxy configuration
+- **Observability**: Monitoring infrastructure, alerting rules, and log aggregation pipelines
+- **Security**: Access control policies, certificate management, and security hardening standards
+
+**Operations** — the procedural knowledge for day-to-day and incident operations:
+- **Runbooks**: Step-by-step guides for common tasks and maintenance windows
+- **Disaster Recovery**: Backup strategies, retention policies, and restoration procedures
+- **Automation**: Ansible playbook reference and scripting standards
+- **Standards**: Naming conventions, change management process, and engineering guidelines
+
+<Tip>
+  Use the sidebar to navigate between sections. Each section begins with an overview page that links to deeper references.
+</Tip>
+
+## Navigating This Documentation
+
+Start with the section most relevant to your immediate need:
+
+- **New to CHIP?** Begin with [Architecture](/platform/architecture) for a platform-wide overview, then explore [Inventory](/platform/inventory) to understand what systems are under management.
+- **Responding to an incident?** Go directly to [Runbooks](/runbooks/overview) or [Disaster Recovery](/disaster-recovery/strategy).
+- **Planning a change?** Review [Change Management](/standards/change-management) and consult the relevant infrastructure section before proceeding.
+- **Automating a task?** See [Ansible](/automation/ansible) and [Scripts](/automation/scripts) for available playbooks and tooling.

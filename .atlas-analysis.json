@@ -1,13 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
+  "projectType": "infrastructure",
+  "projectName": "CHIP — Chiodo Infrastructure Platform",
+  "projectDescription": "CHIP is an enterprise infrastructure operations platform serving as the single source of truth for network architecture, virtualization, containerized services, monitoring, security, and operational governance across hybrid infrastructure.",
   "theme": "aspen",
-  "name": "CHIP",
-  "colors": {
-    "primary": "#ef7025",
-    "light": "#eec9bc",
-    "dark": "#4fa1ab"
-  },
-  "favicon": "/favicon.svg",
+  "primaryColor": "#ef7025",
+  "lightColor": "#eec9bc",
+  "darkColor": "#4fa1ab",
   "navigation": {
     "tabs": [
       {
@@ -103,14 +101,26 @@
       }
     ]
   },
-  "navbar": {
-    "primary": {
-      "type": "button",
-      "label": "Platform",
-      "href": "/introduction"
-    }
-  },
-  "footer": {
-    "socials": {}
-  }
+  "keyFeatures": [
+    "Unified infrastructure source of truth for hybrid environments",
+    "Proxmox virtualization management (VMs, LXC, clustering)",
+    "Docker & containerized service orchestration with stack documentation",
+    "Network architecture documentation (VLANs, routing, firewall, DNS)",
+    "Comprehensive monitoring and alerting with centralized observability",
+    "Security posture management including access control and TLS certificates",
+    "Operational runbooks and step-by-step maintenance procedures",
+    "Disaster recovery planning with backup strategies and restoration guides",
+    "Infrastructure automation with Ansible playbooks and scripting standards",
+    "Engineering standards: naming conventions, change management, governance"
+  ],
+  "publicApiSurface": [
+    "Network topology and VLAN configuration reference",
+    "DNS zone and record management",
+    "Proxmox VM and container lifecycle operations",
+    "Docker Compose stack definitions and service catalog",
+    "Monitoring dashboards and alert rule configuration",
+    "Backup schedules and retention policies",
+    "Ansible playbook inventory and execution reference",
+    "Infrastructure inventory (hosts, roles, hardware)"
+  ]
 }

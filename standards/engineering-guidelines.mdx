@@ -1,0 +1,228 @@
+---
+title: "Engineering Guidelines for CHIP Infrastructure Teams"
+sidebarTitle: "Guidelines"
+description: "The principles that govern every infrastructure decision in CHIP — from version control and documentation to least privilege, immutability, and technology selection."
+---
+
+CHIP's engineering guidelines define the principles that govern how infrastructure is built, changed, and operated. These are not arbitrary rules — each one reflects hard-won lessons about what makes infrastructure reliable, maintainable, and safe to operate at scale. When you understand why a guideline exists, you can apply its intent to situations the guideline does not explicitly cover. When you are unsure whether a proposed approach is consistent with these principles, use them as a decision framework before escalating to a team lead.
+
+<Note>
+These guidelines are reviewed and updated quarterly by the Platform Engineering team. If you believe a guideline is outdated, conflicts with a new technology direction, or is missing coverage for an important area, open a pull request against this document with your proposed change and a rationale. Guidelines evolve through the same review process as infrastructure code.
+</Note>
+
+## Core Engineering Principles
+
+<Accordion title="Infrastructure as Code — All configuration must be version-controlled">
+
+### Principle
+
+Every piece of infrastructure configuration that can be expressed as code must be expressed as code and stored in Git. This includes Ansible playbooks and roles, Docker Compose files, Proxmox VM configurations, network device configurations, DNS zone files, and monitoring rules.
+
+Manual changes made directly on live systems are not permitted in production. If you cannot yet express a configuration as code, you must create a runbook that documents the manual steps, a ticket to automate it, and a record of the manual change in the change management log.
+
+### Why It Matters
+
+Version control gives you an audit trail, a rollback mechanism, and a shared understanding of system state. When an incident occurs, `git log` and `git blame` are often the fastest path to understanding what changed. When you onboard a new team member, the repository is the authoritative reference for how the system is configured.
+
+### In Practice
+
+```bash
+# All infrastructure configuration lives here
+automation/ansible/      # Ansible playbooks and roles
+compose/                 # Docker Compose stack definitions
+network/                 # Network device configuration templates
+monitoring/              # Prometheus rules, Grafana dashboards as JSON
+dns/                     # DNS zone files and records
+```
+
+- Every change to infrastructure configuration goes through a pull request
+- Branches are short-lived — open, review, merge, and delete within the same sprint
+- Commit messages follow the Conventional Commits format: `type(scope): description`
+- Configuration files include comments explaining non-obvious decisions
+
+### Counter-Examples to Avoid
+
+- SSHing into a production host and editing a config file directly without a corresponding PR
+- Deploying a new container by running `docker run` manually instead of updating the Compose stack definition
+- Adding a firewall rule through the UI without updating the corresponding Ansible task
+
+</Accordion>
+
+<Accordion title="Documentation-First — Documentation updates precede deployment">
+
+### Principle
+
+Infrastructure documentation must be updated before or simultaneously with the deployment of any change that alters observable behavior, configuration, or operational procedures. Documentation is not a post-deployment task — it is a precondition for deployment.
+
+This does not mean you write documentation before you understand the change. It means that by the time a change reaches production, the documentation already reflects the new state.
+
+### Why It Matters
+
+Out-of-date documentation is worse than no documentation in some ways — it actively misleads the next engineer who needs to understand the system. In an incident, stale runbooks cause operators to take wrong actions with high confidence. Documentation that is updated as part of the change process avoids this entirely.
+
+### In Practice
+
+Your pull request for any infrastructure change must include:
+
+- Updated architecture diagrams if the topology changed
+- Updated runbooks if operational procedures changed
+- Updated configuration references if parameters or defaults changed
+- A changelog entry summarizing what changed and why
+
+If a change is genuinely too small to require documentation (e.g., adjusting a monitoring threshold), that assessment should be noted in the PR description so reviewers can agree.
+
+### Runbook Standard
+
+Every service managed by CHIP has a runbook. A runbook is not a design document — it is an operational guide for the on-call engineer. It answers:
+
+- How do I verify this service is healthy?
+- What are the common failure modes and how do I resolve them?
+- How do I restart, scale, or roll back this service?
+- Who do I escalate to if I cannot resolve the issue?
+
+</Accordion>
+
+<Accordion title="Least Privilege — Minimum required permissions for all services and users">
+
+### Principle
+
+Every service, automation process, and user account in CHIP operates with the minimum permissions required to perform its function. No service account has administrative access unless it genuinely requires it to function. No user has write access to production systems unless their role requires it.
+
+This principle applies to:
+- Linux system users and sudo rules
+- Docker container capabilities and volume mounts
+- Ansible connection accounts
+- API tokens and service accounts
+- Network ACLs and firewall rules
+
+### Why It Matters
+
+Least privilege limits the blast radius of security incidents. If a service account or user credential is compromised, the attacker's ability to cause damage is bounded by what that account was permitted to do. A compromised read-only monitoring account is a nuisance; a compromised root-equivalent account is a catastrophe.
+
+### In Practice
+
+```yaml
+# Ansible example: create a dedicated service account with minimal permissions
+- name: Create application service user
+  ansible.builtin.user:
+    name: app-svc
+    system: true
+    shell: /sbin/nologin
+    home: /var/lib/app-svc
+    create_home: true
+
+- name: Grant app-svc sudo only for specific commands
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/app-svc
+    content: |
+      app-svc ALL=(root) NOPASSWD: /usr/bin/systemctl restart app.service
+    validate: /usr/sbin/visudo -cf %s
+```
+
+```yaml
+# Docker example: drop all capabilities, add only what's needed
+services:
+  app:
+    image: myapp:latest
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE  # Only if the app binds to a privileged port
+    read_only: true
+    tmpfs:
+      - /tmp
+```
+
+### Access Review
+
+Service account permissions and user access rights are reviewed quarterly. Accounts that have not been used in 90 days are disabled pending review. Accounts belonging to departed team members are revoked within 24 hours of offboarding.
+
+</Accordion>
+
+<Accordion title="Immutable Infrastructure — Prefer replace over modify for VMs">
+
+### Principle
+
+Virtual machines and containers in CHIP are treated as immutable: when you need to update a VM's configuration or OS state significantly, you create a new VM from an updated template rather than modifying the running instance. This is sometimes called "cattle, not pets" — VMs are interchangeable members of a group, not individually configured special cases.
+
+In practice, this means:
+- OS-level changes that cannot be applied idempotently via Ansible are a signal to rebuild from template
+- VMs are not manually configured after provisioning — all post-provisioning configuration goes through Ansible
+- Long-running VMs that accumulate manual changes are considered technical debt
+
+### Why It Matters
+
+Immutable infrastructure makes your state predictable. If you know that every VM was built from the same template and configured only by the same Ansible roles, you can reproduce any VM exactly. Debugging is easier because you know the history. Scaling is easier because new instances are identical to existing ones.
+
+### When to Replace vs. Modify
+
+| Situation | Approach |
+|---|---|
+| OS minor update or package patch | Apply via Ansible (`update-os.yml` playbook) |
+| OS major version upgrade | Rebuild from new template, migrate workload |
+| Application configuration change | Apply via Ansible role |
+| Unrecoverable configuration drift | Rebuild from template |
+| Accumulated manual changes | Rebuild from template, document what was manual |
+
+### Template Management
+
+VM templates are stored as Proxmox templates (IDs `9000–9099`). Templates are rebuilt monthly from the base OS cloud image with the latest patches applied. When a new template version is available, new VMs are provisioned from the updated template — existing VMs receive patch updates via Ansible until their next scheduled replacement cycle.
+
+</Accordion>
+
+<Accordion title="Separation of Concerns — Network, compute, and service layers are independently managed">
+
+### Principle
+
+CHIP's infrastructure is divided into three independently managed layers: network, compute, and service. Changes to one layer should not require changes to another, and the layers should be able to scale and evolve independently.
+
+- **Network layer** — VLANs, routing, firewall rules, DNS. Managed by the `network_devices` Ansible group and the `network/` configuration directory.
+- **Compute layer** — Proxmox hypervisors, VMs, LXC containers, storage. Managed by the `proxmox_nodes` Ansible group and Proxmox API automation.
+- **Service layer** — Docker stacks, application configuration, service discovery. Managed by the `docker_hosts` Ansible group and the `compose/` directory.
+
+### Why It Matters
+
+When layers are not separated, a change to a Docker Compose file can break network routing, or a VM migration can change which services are reachable. Separation of concerns makes changes safer by bounding their scope and makes the system more legible by defining clear ownership.
+
+### In Practice
+
+- Network configuration is never embedded in Docker Compose files or VM templates — it is always managed through the network layer tooling
+- Services communicate through DNS names, not hard-coded IP addresses — this lets compute and service layers change independently
+- Firewall rules reference named groups and services, not specific IP addresses — addresses can change without requiring rule rewrites
+- Service discovery is handled by the internal DNS resolver (`chip.internal`), which is updated automatically when hosts are added to Ansible inventory
+
+</Accordion>
+
+## Technology Selection
+
+When choosing a new tool or technology for CHIP, apply the following criteria before making a decision. New technology introductions require a brief written proposal documenting the evaluation:
+
+| Criterion | Question to Answer |
+|---|---|
+| **Operational complexity** | Can the on-call engineer operate this tool without specialized training at 2am? |
+| **Community and longevity** | Is the project actively maintained with a healthy community? |
+| **Integration** | Does it integrate with existing CHIP tooling (Ansible, Prometheus, Grafana)? |
+| **Licensing** | Is the license compatible with commercial infrastructure use? |
+| **Replaceability** | If we need to replace this tool in two years, how hard will migration be? |
+
+Prefer boring, well-understood technology over novel solutions. The infrastructure platform is not the place to try experimental tools — experimental evaluation belongs in the `lab` environment with a documented exit plan.
+
+## Deprecation Policy
+
+Technologies and patterns that are no longer preferred in CHIP go through a formal deprecation process:
+
+1. **Announcement** — The technology is marked as deprecated in documentation with a clear end-of-life date (minimum 90 days notice)
+2. **Migration path** — A documented migration path to the preferred replacement is published alongside the deprecation notice
+3. **Tooling freeze** — No new instances of the deprecated technology are provisioned from the announcement date
+4. **Migration window** — Existing instances are migrated to the replacement during the deprecation window
+5. **End of life** — At the end-of-life date, remaining instances are decommissioned and monitoring removed
+
+Examples of recently deprecated patterns and their replacements:
+
+| Deprecated | Replacement | Reason |
+|---|---|---|
+| Manual crontabs on hosts | Ansible `cron` module in roles | Not version-controlled or auditable |
+| Docker run commands | Docker Compose stacks | No state management, hard to reproduce |
+| Static IP assignment | DNS-based service discovery | Brittle, requires changes in multiple places |

@@ -1,0 +1,80 @@
+---
+title: "Automation Overview: Tools, Principles & Inventory"
+sidebarTitle: "Overview"
+description: "Understand CHIP's automation philosophy, the tools in use, and the principles that guide repeatable, version-controlled infrastructure automation."
+---
+
+CHIP is built around the principle that any task performed more than once should be automated, and any task that cannot yet be automated must be documented as a runbook. Automation reduces human error, enforces consistency across environments, and gives your team the confidence to move quickly without breaking things. Every automation artifact in CHIP — whether an Ansible playbook, a shell script, or a scheduled cron job — is version-controlled, peer-reviewed, and tested before reaching production.
+
+## Automation Philosophy
+
+The goal of automation in CHIP is not to eliminate human judgment — it is to apply human judgment once and encode it reliably for all future executions. When you automate a task, you are writing down the best way your team knows how to do that thing, in a form that can be reviewed, improved, and re-run with confidence.
+
+Three principles guide every automation decision:
+
+- **Idempotency** — Running an automation twice should produce the same result as running it once. You should never need to undo automation side effects before re-running.
+- **Version control** — All automation lives in Git. Changes are made through pull requests with peer review, not through ad-hoc edits on live systems.
+- **Tested before production** — Automation is validated in a non-production environment before it touches anything critical.
+
+<Tip>
+Always run and verify your automation in the `dev` or `staging` environment before targeting production hosts. A five-minute test run can save hours of incident response.
+</Tip>
+
+## Automation Tools
+
+CHIP uses three primary automation tools, each suited to a different scope of work:
+
+| Tool | Use Case | Scope | Location |
+|---|---|---|---|
+| **Ansible** | Configuration management, software deployment, system updates | Multi-host, role-based | `automation/ansible/` |
+| **Shell Scripts** | Host-local tasks, maintenance routines, one-off utilities | Single host or local execution | `automation/scripts/` |
+| **Cron Jobs** | Scheduled recurring tasks (backups, health checks, cleanup) | Per-host schedules | Managed via Ansible roles |
+| **Python Scripts** | Complex data processing, API integrations, report generation | Any scope requiring logic | `automation/scripts/python/` |
+
+## When to Use Each Tool
+
+Choosing the right tool for a task is as important as writing the automation itself. Using the wrong tool creates maintenance burden and confusion for the next engineer.
+
+<CardGroup cols={2}>
+  <Card title="Use Ansible when…" icon="gears">
+    The task needs to run across multiple hosts, involves configuration state, or belongs to a repeatable deployment workflow. Ansible is your default for anything that touches infrastructure configuration.
+  </Card>
+  <Card title="Use Shell Scripts when…" icon="terminal">
+    The task is scoped to a single host, requires tight integration with system tools, or is a utility that operators run interactively. Keep scripts focused and well-documented.
+  </Card>
+  <Card title="Use Cron Jobs when…" icon="clock">
+    The task needs to run on a schedule without human intervention. Cron jobs in CHIP are always defined in Ansible roles so they are version-controlled and consistently deployed.
+  </Card>
+  <Card title="Use Python Scripts when…" icon="code">
+    The task involves complex logic, external API calls, data transformation, or anything that would become unmaintainable in Bash. Python scripts follow the same standards as shell scripts.
+  </Card>
+</CardGroup>
+
+## Automation Principles in Detail
+
+### Idempotency
+
+Every automation artifact must be safe to re-run. This means checking state before making changes, using Ansible's built-in idempotency guarantees, and writing scripts that detect when a task is already complete. An operator should be able to run any playbook or script multiple times without causing damage or duplicate work.
+
+### Version Control
+
+All automation code lives in the `automation/` directory of the CHIP repository. No automation is written directly on production hosts. Every change goes through a pull request, and the commit history serves as an audit trail. When something breaks, `git blame` and `git log` are your first diagnostic tools.
+
+### Testability
+
+Each playbook and script has a defined test procedure. For Ansible, this means running with `--check` (dry-run mode) and targeting a staging host before production. For scripts, this means running against a test data set or a non-production environment. Untested automation is treated the same as untested code — it does not go to production.
+
+### Documentation
+
+Every automation artifact is documented. Playbooks have inline comments explaining non-obvious steps. Scripts include a header block describing purpose, usage, and expected inputs. If an automation artifact requires manual prerequisites, those prerequisites are written down in the relevant runbook.
+
+## Explore Automation Tools
+
+<CardGroup cols={2}>
+  <Card title="Ansible" icon="layer-group" href="/automation/ansible">
+    Explore the Ansible setup: inventory structure, playbook reference, vault secrets, and step-by-step instructions for running playbooks safely.
+  </Card>
+  <Card title="Scripts" icon="scroll" href="/automation/scripts">
+    Browse the utility script library, learn the scripting conventions, and find out how to add a new script to the automation codebase.
+  </Card>
+</CardGroup>

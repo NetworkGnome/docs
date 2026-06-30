@@ -1,0 +1,282 @@
+---
+title: "Ansible Automation: Playbooks, Inventory & Secrets"
+sidebarTitle: "Ansible"
+description: "Learn how CHIP uses Ansible for configuration management — including inventory structure, playbook reference, vault secrets, and safe execution practices."
+---
+
+Ansible is the primary configuration management and deployment tool in CHIP. It manages software installation, system configuration, service deployment, and scheduled maintenance tasks across all infrastructure hosts. Every Ansible artifact — inventory files, playbooks, roles, and variable files — is stored in the `automation/ansible/` directory and managed through Git. Direct configuration changes on live hosts are not permitted; if a change cannot be expressed as an Ansible task, it must first be documented as a runbook and then automated.
+
+## Repository Structure
+
+The Ansible directory follows a standard layout that separates inventory from playbooks, roles, and variables:
+
+```
+automation/ansible/
+├── inventory/
+│   ├── production/
+│   │   ├── hosts.yml
+│   │   ├── group_vars/
+│   │   │   ├── all.yml
+│   │   │   ├── proxmox_nodes.yml
+│   │   │   ├── docker_hosts.yml
+│   │   │   └── network_devices.yml
+│   │   └── host_vars/
+│   │       ├── pve-prod-01.yml
+│   │       └── pve-prod-02.yml
+│   └── staging/
+│       ├── hosts.yml
+│       └── group_vars/
+├── playbooks/
+│   ├── update-docker.yml
+│   ├── deploy-stack.yml
+│   ├── rotate-certs.yml
+│   ├── baseline-hardening.yml
+│   └── backup-verify.yml
+├── roles/
+│   ├── common/
+│   ├── docker/
+│   ├── monitoring/
+│   ├── nginx/
+│   └── backup/
+└── vault/
+    ├── production.yml
+    └── staging.yml
+```
+
+## Inventory Groups
+
+CHIP's Ansible inventory is organized into host groups that reflect infrastructure function. You should always target a group — not an individual host — when writing playbooks, unless a task is genuinely host-specific.
+
+| Group | Members | Purpose |
+|---|---|---|
+| `proxmox_nodes` | All Proxmox hypervisor hosts | Hypervisor-level tasks: VM management, storage, clustering |
+| `docker_hosts` | All hosts running Docker workloads | Container lifecycle, stack deployments, image updates |
+| `network_devices` | Managed switches, routers, firewalls | Network configuration, VLAN management, firmware updates |
+| `monitoring` | Prometheus, Grafana, Alertmanager hosts | Monitoring stack configuration and updates |
+| `storage_nodes` | NAS and object storage hosts | Storage configuration, mount management, backup agents |
+| `bastion` | Jump hosts and VPN gateways | Access control, key rotation, audit logging |
+| `all` | Every host in the inventory | Cross-cutting tasks: OS updates, NTP, baseline hardening |
+
+### Variable Hierarchy
+
+Variables follow Ansible's standard precedence order. In CHIP, the following layers are in use from lowest to highest precedence:
+
+1. **`group_vars/all.yml`** — Global defaults (NTP servers, DNS resolvers, log retention)
+2. **`group_vars/<group>.yml`** — Group-specific settings (e.g., Docker daemon config for `docker_hosts`)
+3. **`host_vars/<hostname>.yml`** — Host-specific overrides (e.g., a unique network interface name)
+4. **`-e` extra vars at runtime** — Deployment-time overrides (e.g., `stack_name=monitoring`)
+
+<Note>
+Never hardcode values like IP addresses, passwords, or environment-specific strings in playbooks or roles. Use variables. Secrets belong in the vault — never in plaintext variable files.
+</Note>
+
+## Playbook Reference
+
+| Playbook | Description | Target Group | Tags | Est. Duration |
+|---|---|---|---|---|
+| `update-docker.yml` | Pull latest images, recreate containers, prune unused images | `docker_hosts` | `docker`, `update` | 8–15 min |
+| `deploy-stack.yml` | Deploy or redeploy a named Docker Compose stack | `docker_hosts` | `deploy`, `stack` | 3–5 min |
+| `rotate-certs.yml` | Renew TLS certificates via ACME/Let's Encrypt | `all` | `certs`, `tls` | 2–4 min |
+| `baseline-hardening.yml` | Apply CIS-aligned hardening: SSH config, firewall rules, audit logging | `all` | `hardening`, `security` | 10–20 min |
+| `backup-verify.yml` | Trigger a backup verification check on all backup targets | `storage_nodes` | `backup`, `verify` | 5–10 min |
+| `update-os.yml` | Apply OS package updates and reboot if required | `all` | `os`, `update` | 10–30 min |
+| `network-config.yml` | Push VLAN and interface configuration to network devices | `network_devices` | `network`, `vlan` | 5–8 min |
+
+## Running Playbooks
+
+### Basic Invocation
+
+```bash
+# Update Docker containers on all production Docker hosts
+ansible-playbook -i inventory/production playbooks/update-docker.yml --tags docker
+
+# Deploy a specific stack by name
+ansible-playbook -i inventory/production playbooks/deploy-stack.yml -e stack_name=monitoring
+
+# Apply OS updates to all hosts
+ansible-playbook -i inventory/production playbooks/update-os.yml --tags os,update
+
+# Limit execution to a specific host
+ansible-playbook -i inventory/production playbooks/update-docker.yml --limit pve-prod-02
+
+# Limit execution to a specific group
+ansible-playbook -i inventory/production playbooks/baseline-hardening.yml --limit docker_hosts
+```
+
+### Dry-Run Mode
+
+Always use `--check` before running a playbook against production for the first time or after significant changes. Dry-run mode executes all Ansible logic but makes no actual changes to target hosts.
+
+```bash
+# Dry run: show what would change without making changes
+ansible-playbook -i inventory/production playbooks/update-os.yml --check
+
+# Dry run with diff output to see file content changes
+ansible-playbook -i inventory/production playbooks/baseline-hardening.yml --check --diff
+```
+
+<Warning>
+Do not run playbooks against production hosts without first completing a `--check` run and reviewing the output. Changes that look minor in a playbook can have significant downstream effects — particularly for network configuration and hardening playbooks.
+</Warning>
+
+### Verbosity Flags
+
+Increase output verbosity when diagnosing failures. Each additional `-v` adds more detail:
+
+```bash
+ansible-playbook -i inventory/production playbooks/deploy-stack.yml -e stack_name=monitoring -v    # Task results
+ansible-playbook -i inventory/production playbooks/deploy-stack.yml -e stack_name=monitoring -vv   # Module args
+ansible-playbook -i inventory/production playbooks/deploy-stack.yml -e stack_name=monitoring -vvv  # Connection debug
+```
+
+## Running a Playbook Against Production
+
+Follow these steps every time you execute a playbook in the production environment:
+
+<Steps>
+  <Step title="Confirm your inventory is current">
+    Pull the latest changes from Git and verify the inventory reflects the current production host list. Check `git log inventory/production/` for recent changes.
+
+    ```bash
+    git pull origin main
+    cat inventory/production/hosts.yml
+    ```
+  </Step>
+  <Step title="Review the playbook and any recent changes">
+    Read through the playbook and any roles it calls. If the playbook was recently modified, review the diff in Git to understand what changed.
+
+    ```bash
+    git log --oneline playbooks/update-docker.yml
+    git show HEAD:playbooks/update-docker.yml
+    ```
+  </Step>
+  <Step title="Run a dry-run against staging first">
+    Execute the playbook with `--check` against the staging inventory. Confirm the output matches expectations — no unexpected changes, no failures.
+
+    ```bash
+    ansible-playbook -i inventory/staging playbooks/update-docker.yml --check --diff
+    ```
+  </Step>
+  <Step title="Run a dry-run against production">
+    Once staging looks clean, run `--check` against the production inventory. Review every task marked as `changed` — those are the hosts and resources that will be modified.
+
+    ```bash
+    ansible-playbook -i inventory/production playbooks/update-docker.yml --check --diff
+    ```
+  </Step>
+  <Step title="Execute against production during the change window">
+    With approvals in place and the change window open, run the playbook for real. Monitor output in your terminal and watch your monitoring dashboards in parallel.
+
+    ```bash
+    ansible-playbook -i inventory/production playbooks/update-docker.yml --tags docker
+    ```
+  </Step>
+  <Step title="Verify and document">
+    After the run completes, verify the intended outcome (services running, configurations applied, no alerts firing). Update the change record with the playbook output and any observations.
+  </Step>
+</Steps>
+
+## Vault: Managing Secrets
+
+Ansible Vault encrypts sensitive values so they can be safely committed to Git alongside the rest of your automation code. All secrets in CHIP — API keys, database passwords, TLS private keys, service tokens — are stored in vault-encrypted files.
+
+### Vault File Locations
+
+```
+automation/ansible/vault/
+├── production.yml   # Production secrets
+└── staging.yml      # Staging secrets
+```
+
+### Common Vault Operations
+
+```bash
+# Edit the production vault (opens in $EDITOR)
+ansible-vault edit vault/production.yml
+
+# View vault contents without editing
+ansible-vault view vault/production.yml
+
+# Encrypt a new secret value inline
+ansible-vault encrypt_string 'my-secret-password' --name 'db_password'
+
+# Run a playbook that uses vault variables
+ansible-playbook -i inventory/production playbooks/deploy-stack.yml \
+  --vault-password-file ~/.vault_pass \
+  -e stack_name=monitoring
+
+# Use an environment variable for the vault password (CI/CD)
+ANSIBLE_VAULT_PASSWORD_FILE=~/.vault_pass \
+  ansible-playbook -i inventory/production playbooks/deploy-stack.yml
+```
+
+<Info>
+The vault password file (`~/.vault_pass`) must never be committed to Git. It is provisioned to authorized operators via the team password manager. In CI/CD pipelines, the vault password is injected as an environment secret.
+</Info>
+
+### Adding a New Secret
+
+<Steps>
+  <Step title="Open the appropriate vault file">
+    Choose `vault/production.yml` or `vault/staging.yml` based on the target environment.
+
+    ```bash
+    ansible-vault edit vault/production.yml
+    ```
+  </Step>
+  <Step title="Add the variable in YAML format">
+    Use a descriptive, namespaced variable name. Prefix with the service or role that consumes the secret.
+
+    ```yaml
+    grafana_admin_password: "your-secret-value"
+    postgres_replication_password: "another-secret"
+    ```
+  </Step>
+  <Step title="Reference the variable in a role or playbook">
+    Vault variables are available automatically once the vault file is loaded. Reference them just like any other variable.
+
+    ```yaml
+    - name: Set Grafana admin password
+      community.grafana.grafana_user:
+        url: "{{ grafana_url }}"
+        url_password: "{{ grafana_admin_password }}"
+    ```
+  </Step>
+  <Step title="Commit and push">
+    Commit the updated vault file. Because it is encrypted, it is safe to store in Git. Always commit vault changes in a separate commit from playbook logic changes.
+
+    ```bash
+    git add vault/production.yml
+    git commit -m "vault: add grafana_admin_password for monitoring stack"
+    git push origin feature/monitoring-deploy
+    ```
+  </Step>
+</Steps>
+
+## Ansible Configuration
+
+The `ansible.cfg` file in the `automation/ansible/` directory sets project-wide defaults:
+
+```ini
+[defaults]
+inventory          = inventory/production
+roles_path         = roles
+vault_password_file = ~/.vault_pass
+retry_files_enabled = False
+stdout_callback    = yaml
+host_key_checking  = True
+forks              = 10
+
+[privilege_escalation]
+become             = True
+become_method      = sudo
+become_user        = root
+
+[ssh_connection]
+pipelining         = True
+control_path       = /tmp/ansible-ssh-%%h-%%p-%%r
+```
+
+<Tip>
+Set `ANSIBLE_FORCE_COLOR=1` in your shell profile to get colored output when running playbooks locally. It makes it significantly easier to spot failures and warnings in long playbook runs.
+</Tip>

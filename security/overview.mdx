@@ -1,0 +1,118 @@
+---
+title: "CHIP Security Posture and Defense-in-Depth Overview"
+sidebarTitle: "Overview"
+description: "Understand CHIP's layered security model, zero-trust principles, security controls across every infrastructure tier, and the vulnerability management process."
+---
+
+CHIP is built around a defense-in-depth philosophy: no single control is trusted as sufficient, and every layer of the platform assumes that adjacent layers can be compromised. Rather than relying on a hardened perimeter alone, CHIP applies security controls at the network, host, service, identity, and data layers simultaneously. This layered approach ensures that the compromise of one control — a misconfigured firewall rule, a leaked credential, or an unpatched library — does not translate directly into a full platform breach. Zero-trust principles further reinforce this model: every connection, whether from a human operator or a service account, must be authenticated and authorized regardless of its origin network.
+
+## Security Principles
+
+The following core principles guide every architectural and operational decision in CHIP:
+
+- **Least privilege** — Users, services, and automation are granted the minimum permissions required to perform their function, and no more.
+- **Assume breach** — Controls are designed on the assumption that any given component can be compromised. Lateral movement is limited through network micro-segmentation and mTLS between services.
+- **Explicit verification** — No implicit trust is granted based on network location (e.g., "inside the data center"). Every connection is authenticated.
+- **Encrypt everywhere** — All data in transit is encrypted with TLS 1.2 or higher. Data at rest on managed volumes is encrypted with AES-256.
+- **Auditability** — Every privileged action by a human or service is logged and immutably retained for 365 days.
+
+## Security Layers
+
+### Network Segmentation
+
+CHIP divides infrastructure into network zones with enforced traffic policies between them. Ingress from the internet is limited to a small set of published services fronted by a WAF and DDoS mitigation layer. Internal east-west traffic between zones is explicitly allowed by policy and denied by default.
+
+| Zone | Purpose | Inbound From |
+|---|---|---|
+| `dmz` | Public-facing load balancers, WAF | Internet (HTTP/HTTPS only) |
+| `app` | Application workloads, APIs | `dmz` (proxied traffic only) |
+| `data` | Databases, message queues, caches | `app` zone (explicit ports only) |
+| `mgmt` | CHIP control plane, monitoring, bastion | Operator VPN only |
+| `storage` | Object storage, backup targets | `app`, `data`, `mgmt` (explicit ports) |
+
+### Host Hardening
+
+Every host managed by CHIP is provisioned from a hardened base image and maintained by the CHIP configuration management layer:
+
+- CIS Level 2 benchmark applied at provisioning time and enforced continuously via drift detection
+- Non-essential services disabled; only required ports opened in the host firewall (`ufw` / `firewalld`)
+- Kernel hardening: `sysctl` tweaks for network stack security, restricted `/proc` access
+- File integrity monitoring (FIM) on critical system paths via `AIDE` or `Falco`
+- Automatic unattended security patching for OS packages (see Patch Cadence below)
+
+### Service Authentication (mTLS)
+
+Services within the `app` and `data` zones communicate over mutually authenticated TLS. Each service is issued a short-lived certificate from the CHIP internal CA (see [Certificates](/security/certificates)). Certificate validity is 24 hours for service-to-service certs, ensuring that a compromised certificate has a minimal blast radius.
+
+### TLS Everywhere
+
+All user-facing and internal endpoints enforce TLS. CHIP's certificate automation ensures no certificate expires without renewal (see [Certificates](/security/certificates)). The minimum supported TLS version across all services is **TLS 1.2**, with TLS 1.3 preferred. Weak cipher suites are explicitly disabled.
+
+### Audit Logging
+
+Every privileged action — SSH logins, sudo executions, CHIP control-plane API calls, Kubernetes RBAC events — is shipped to the centralized audit log stream with a 365-day retention. Audit logs are stored in a write-only stream that operators cannot modify or delete after ingestion. See [Logging](/observability/logging) for details on querying audit logs.
+
+## Security Controls Summary
+
+| Layer | Control | Implementation |
+|---|---|---|
+| Network perimeter | WAF, DDoS mitigation | Cloudflare / reverse proxy with rule sets |
+| Network segmentation | Zone-based firewall policies | VLAN segmentation, `iptables` / `nftables` zone policies |
+| Host OS | Hardened base image | CIS Level 2 benchmark, automated drift remediation |
+| Host OS | File integrity monitoring | `AIDE` scheduled scan + `Falco` runtime detection |
+| Host access | SSH key-only authentication | Password auth disabled, key rotation enforced annually |
+| Host access | Sudo policy | Role-based sudoers managed by CHIP configuration management |
+| Service identity | mTLS between services | CHIP internal CA, 24-hour cert TTL, automatic rotation |
+| Service access | RBAC | CHIP control-plane RBAC, Kubernetes RBAC, per-service ACLs |
+| Data in transit | TLS 1.2+ enforcement | Certificate automation, cipher policy via config management |
+| Data at rest | Volume encryption | LUKS (bare-metal), cloud provider KMS-backed encryption (cloud) |
+| Identity | MFA for all human access | TOTP or hardware key via CHIP SSO (see [Access Control](/security/access-control)) |
+| Secrets | Secrets management | HashiCorp Vault with dynamic secrets and short TTLs |
+| Audit | Immutable audit log | Promtail → Loki write-once stream, 365-day retention |
+| Vulnerability management | CVE scanning | Trivy (container images), OpenVAS (hosts), weekly scans |
+
+## Vulnerability Management
+
+### Scanning
+
+CHIP runs automated vulnerability scans on a scheduled basis:
+
+- **Container images** — Trivy scans run at image build time (CI pipeline gate) and weekly against all images running in production. Critical CVEs block the CI pipeline.
+- **Host OS packages** — OpenVAS network scans run weekly against all hosts. Results are ingested into the CHIP vulnerability tracker.
+- **Infrastructure configuration** — `kube-bench` (Kubernetes CIS benchmark) and Terraform `tfsec` / `checkov` run in CI on every configuration change.
+
+### Patch Cadence
+
+| Patch Type | Target Remediation Time | Process |
+|---|---|---|
+| Critical OS CVE (CVSS ≥ 9.0) | 24 hours | Emergency change (CHG-URGENT), auto-patching enabled |
+| High OS CVE (CVSS 7.0–8.9) | 7 days | Standard change, unattended upgrade |
+| Medium / Low OS CVE | 30 days | Bundled in monthly maintenance window |
+| Container base image rebuild | 7 days for high/critical | CI pipeline triggers image rebuild and redeploy |
+| Dependency vulnerability | 14 days | Dependabot / Renovate PR, reviewed by owning team |
+
+<Note>
+All new services deployed to the CHIP platform must undergo a security review before their first production deployment. The review covers network exposure, authentication model, secrets handling, and TLS configuration. Submit a security review request via the internal ticketing system using the **CHIP-SEC** request template. Reviews are typically completed within 3 business days.
+</Note>
+
+## Incident Response
+
+Security incidents follow CHIP's standard incident response playbook with additional containment steps:
+
+1. **Detect** — Alert fires via CHIP monitoring or security tooling (Falco, audit log anomaly)
+2. **Contain** — Affected host or service is isolated at the network layer; active sessions terminated
+3. **Investigate** — Audit logs, system logs, and Prometheus metrics reviewed to determine scope
+4. **Eradicate** — Root cause remediated; compromised credentials revoked; patched image redeployed
+5. **Recover** — Service restored; smoke tests run; monitoring confirms healthy state
+6. **Post-mortem** — Blameless post-mortem within 5 business days; action items tracked to completion
+
+## Further Reading
+
+<CardGroup cols={2}>
+  <Card title="Access Control" icon="key" href="/security/access-control">
+    Learn how operators and services are granted access, SSH key management, MFA requirements, and the service account model.
+  </Card>
+  <Card title="Certificates" icon="shield-check" href="/security/certificates">
+    Understand TLS certificate issuance, the internal CA, renewal procedures, and certificate inventory management.
+  </Card>
+</CardGroup>

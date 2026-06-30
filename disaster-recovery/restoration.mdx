@@ -1,0 +1,443 @@
+---
+title: "Infrastructure Restoration Procedures and Runbooks"
+sidebarTitle: "Restoration"
+description: "Step-by-step restoration runbooks for Proxmox VMs, LXC containers, and Docker volumes, including partial restores and post-restoration verification."
+---
+
+Restoration procedures are the operational heart of disaster recovery. When data is lost, a VM is corrupted, or a container fails to start after an incident, this page provides the exact steps to recover each component type from a known-good backup. The procedures here work directly with the backup architecture described in the [Backups documentation](/disaster-recovery/backups). Before beginning any restore, confirm which backup is appropriate for your recovery point objective, open a change ticket, and notify the service owner.
+
+<Warning>
+  Never restore directly to a production environment without first testing the restoration on a non-production host. A failed or incomplete restore that corrupts live data can turn a recoverable incident into a catastrophic one. The extra time spent on a test restore is always worth it.
+</Warning>
+
+---
+
+## Before You Begin
+
+Complete these steps before starting any restoration procedure:
+
+1. **Open a change ticket** with the type set to "Emergency Change — DR Restoration." Record the affected service, the failure description, and the recovery point you intend to restore to.
+2. **Confirm the backup is available** using the backup verification steps in the [Backups runbook](/disaster-recovery/backups).
+3. **Identify the correct recovery point** — choose the most recent backup that pre-dates the failure event. If the failure was gradual (e.g., data corruption that accumulated over days), you may need an older recovery point.
+4. **Notify the service owner** that a restoration is in progress. They need to know the expected RTO and whether any data written after the recovery point will be lost.
+5. **Secure the encryption key** for the backup from CHIP Secrets before starting. You will need it during the restore.
+
+---
+
+## Restoration Procedures
+
+<Tabs>
+  <Tab title="VM Restoration (PBS)">
+
+    This procedure restores a Proxmox virtual machine from a Proxmox Backup Server snapshot. It covers both restoring to the original VM ID and restoring to a new VM (recommended for production incidents where you want to validate the restore before replacing the original).
+
+    <Steps>
+      <Step title="Access the PBS restore interface">
+        Log into the Proxmox VE web interface on the node where the VM will be restored. Navigate to **Datacenter → Storage → PBS Datastore** and browse to the affected VM's backup list.
+
+        Alternatively, use the CLI on the Proxmox node:
+
+        ```bash
+        # List all available snapshots for the VM
+        proxmox-backup-client snapshots \
+          --repository <pbs-user>@pam@<pbs-host>:<datastore> \
+          vm/<vmid>
+        ```
+
+        Note the snapshot ID (e.g., `vm/100/2024-11-15T02:00:00Z`) for the recovery point you want.
+      </Step>
+      <Step title="Restore to a new VM ID (recommended)">
+        Restore to a new, unused VM ID so the original VM remains intact during validation.
+
+        ```bash
+        qmrestore \
+          pbs:<pbs-storage-id>:vm/<vmid>/<snapshot-id> \
+          <new-vmid> \
+          --storage <target-storage> \
+          --unique 1
+        ```
+
+        The `--unique 1` flag generates a new MAC address and VM UUID to prevent network conflicts if both VMs are running simultaneously.
+
+        Example:
+        ```bash
+        qmrestore \
+          pbs:backup-store:vm/100/2024-11-15T02:00:00Z \
+          199 \
+          --storage local-lvm \
+          --unique 1
+        ```
+      </Step>
+      <Step title="Start the restored VM and validate">
+        Start the new VM and confirm it boots successfully.
+
+        ```bash
+        qm start <new-vmid>
+        qm status <new-vmid>
+        ```
+
+        Wait for the VM to reach `running` status, then open a console and confirm:
+        - The OS boots without kernel errors
+        - SSH is accessible
+        - The application starts and data is intact
+
+        ```bash
+        # Test SSH connectivity
+        ssh operator@<restored-vm-ip> "systemctl status <application-service>"
+        ```
+      </Step>
+      <Step title="Verify application data integrity">
+        Work with the service owner to verify that the restored data matches expectations at the recovery point. For database-backed applications, run a basic data integrity query:
+
+        ```bash
+        # PostgreSQL example
+        psql -h <restored-vm-ip> -U <db-user> -d <db-name> \
+          -c "SELECT count(*), max(updated_at) FROM <key-table>;"
+        ```
+
+        Confirm the row counts and timestamps are consistent with the expected recovery point.
+      </Step>
+      <Step title="Replace the failed VM (production cutover)">
+        Once the restored VM is validated, stop the original failed VM (if still present), reassign the IP address, and rename the restored VM.
+
+        ```bash
+        # Stop and rename the failed VM
+        qm stop <original-vmid>
+        qm set <original-vmid> --name <original-name>-FAILED-$(date +%Y%m%d)
+
+        # Update the restored VM to use the original name and IP
+        qm set <new-vmid> --name <original-vm-name>
+
+        # Update the CHIP inventory
+        chip inventory update-host \
+          --old-vmid <original-vmid> \
+          --new-vmid <new-vmid> \
+          --hostname <original-hostname>
+        ```
+      </Step>
+      <Step title="Update DNS and monitoring">
+        If the restored VM has a different IP (because you restored to a new host), update the DNS record and confirm monitoring is tracking the correct host.
+
+        ```bash
+        chip dns update --fqdn <service-fqdn> --type A --value <restored-vm-ip>
+        chip monitoring update-host --vmid <new-vmid>
+        ```
+      </Step>
+    </Steps>
+
+  </Tab>
+  <Tab title="LXC Container Restoration">
+
+    LXC container restoration follows a similar flow to VM restoration but uses the `pct` command set. LXC containers are typically smaller and restore faster than full VMs.
+
+    <Steps>
+      <Step title="List available container snapshots">
+        Browse the available PBS snapshots for the target container.
+
+        ```bash
+        proxmox-backup-client snapshots \
+          --repository <pbs-user>@pam@<pbs-host>:<datastore> \
+          ct/<ctid>
+        ```
+
+        Identify the snapshot ID for your target recovery point.
+      </Step>
+      <Step title="Restore the container to a new ID">
+        Restore to a new container ID to preserve the original during validation.
+
+        ```bash
+        pct restore <new-ctid> \
+          pbs:<pbs-storage-id>:ct/<ctid>/<snapshot-id> \
+          --storage <target-storage> \
+          --unique 1
+        ```
+
+        Example:
+        ```bash
+        pct restore 299 \
+          pbs:backup-store:ct/200/2024-11-15T01:30:00Z \
+          --storage local-lvm \
+          --unique 1
+        ```
+      </Step>
+      <Step title="Configure network settings for the restored container">
+        If restoring to a different host or for isolated testing, update the container's network configuration before starting it to prevent IP conflicts.
+
+        ```bash
+        # View current network config
+        pct config <new-ctid>
+
+        # Update the IP address if needed
+        pct set <new-ctid> \
+          --net0 name=eth0,bridge=vmbr0,ip=<test-ip>/24,gw=<gateway>
+        ```
+      </Step>
+      <Step title="Start and validate the container">
+        Start the restored container and verify it runs correctly.
+
+        ```bash
+        pct start <new-ctid>
+        pct status <new-ctid>
+
+        # Open a shell in the container
+        pct exec <new-ctid> -- bash -c "systemctl status"
+        ```
+
+        Confirm the application service is running and data is accessible.
+      </Step>
+      <Step title="Perform the production cutover">
+        After successful validation, stop the failed container, reassign the original IP, and start the restored container in its place.
+
+        ```bash
+        # Stop the original failed container
+        pct stop <original-ctid>
+
+        # Update the restored container with the production network config
+        pct set <new-ctid> \
+          --net0 name=eth0,bridge=vmbr0,ip=<production-ip>/24,gw=<gateway>
+
+        # Rename for clarity
+        pct set <new-ctid> --hostname <original-hostname>
+
+        # Start the restored container
+        pct start <new-ctid>
+        ```
+      </Step>
+      <Step title="Update the CHIP inventory">
+        Replace the original container record in CHIP with the new container ID.
+
+        ```bash
+        chip inventory update-host \
+          --old-ctid <original-ctid> \
+          --new-ctid <new-ctid> \
+          --hostname <original-hostname>
+        ```
+      </Step>
+    </Steps>
+
+  </Tab>
+  <Tab title="Docker Volume Restoration">
+
+    Docker volume restoration covers both database volumes (backed up via pg_dump/mysqldump) and generic named volumes (backed up by the chip-backup-agent). The procedure differs depending on the backup method used for the volume.
+
+    <Steps>
+      <Step title="Identify the backup type and location">
+        Determine whether the volume was backed up as a database dump or as a raw volume archive.
+
+        ```bash
+        chip backup list \
+          --host <docker-host> \
+          --type docker-volume \
+          --verbose
+        ```
+
+        The output indicates the backup method (`database-dump` or `volume-archive`) and the storage location.
+      </Step>
+      <Step title="Stop the application containers using the volume">
+        Before restoring a volume, stop all containers that mount it to prevent data corruption during the restore.
+
+        ```bash
+        # Identify containers using the target volume
+        docker ps -a --filter volume=<volume-name> \
+          --format "table {{.Names}}\t{{.Status}}"
+
+        # Stop the relevant compose stack or containers
+        docker compose -f docker-compose.<stack>.yml stop <service-name>
+        # or
+        docker stop <container-name>
+        ```
+      </Step>
+      <Step title="Restore a database volume (pg_dump / mysqldump)">
+        For database volumes backed up via dump method:
+
+        ```bash
+        # Download the backup archive
+        chip backup download \
+          --job docker-volume-databases \
+          --target <volume-name> \
+          --snapshot <snapshot-id> \
+          --output /tmp/<volume-name>-restore.sql.gz
+
+        # Restore PostgreSQL
+        gunzip -c /tmp/<volume-name>-restore.sql.gz | \
+          docker exec -i <postgres-container> \
+          psql -U <db-user> -d <db-name>
+
+        # Restore MySQL
+        gunzip -c /tmp/<volume-name>-restore.sql.gz | \
+          docker exec -i <mysql-container> \
+          mysql -u <db-user> -p<db-password> <db-name>
+        ```
+
+        <Note>
+          For PostgreSQL, you may need to drop and recreate the target database before restoring if the dump was made with `--clean` flags. Consult the application team before dropping a production database.
+        </Note>
+      </Step>
+      <Step title="Restore a generic volume archive (chip-backup-agent)">
+        For volumes backed up as raw archives:
+
+        ```bash
+        # Download the volume archive
+        chip backup download \
+          --job docker-volume-app-data \
+          --target <volume-name> \
+          --snapshot <snapshot-id> \
+          --output /tmp/<volume-name>-restore.tar.zst
+
+        # Decompress and restore into the volume
+        docker run --rm \
+          -v <volume-name>:/target \
+          -v /tmp:/backup \
+          alpine sh -c "cd /target && tar -I zstd -xf /backup/<volume-name>-restore.tar.zst --strip-components=1"
+        ```
+      </Step>
+      <Step title="Restart the application containers">
+        Start the containers that were stopped in step 2 and verify they start successfully.
+
+        ```bash
+        docker compose -f docker-compose.<stack>.yml start <service-name>
+        docker logs --tail 50 <container-name>
+        ```
+      </Step>
+      <Step title="Verify application data integrity">
+        Confirm the application is functioning correctly with the restored data. Run the application's built-in health check and verify that key data entities are present at the expected recovery point.
+
+        ```bash
+        curl -sf http://<service-host>:<port>/health | jq .
+        ```
+      </Step>
+    </Steps>
+
+  </Tab>
+</Tabs>
+
+---
+
+## Partial Restoration
+
+When only a subset of data needs to be recovered — such as a single deleted file, an accidentally truncated table, or a corrupted configuration — a full VM or volume restore is unnecessarily disruptive. Use the partial restore procedures below.
+
+### Single File Restoration from PBS
+
+Mount a PBS snapshot as a read-only filesystem and copy only the target file, without restoring the entire VM.
+
+```bash
+# Mount the snapshot to a temporary directory
+proxmox-backup-client mount \
+  --repository <pbs-user>@pam@<pbs-host>:<datastore> \
+  vm/<vmid>/<snapshot-id> \
+  /mnt/pbs-restore \
+  --drive-name scsi0
+
+# Browse the mounted filesystem
+ls /mnt/pbs-restore/
+
+# Copy the specific file to the target location
+cp /mnt/pbs-restore/var/lib/<app>/<config-file> /tmp/<config-file>.restored
+
+# Unmount when done
+proxmox-backup-client unmount /mnt/pbs-restore
+```
+
+Transfer the extracted file to the live VM using SCP or your configuration management tooling.
+
+### Database Table Restoration
+
+To restore a single table from a database backup without replacing the entire database:
+
+```bash
+# Download the full dump
+chip backup download \
+  --job docker-volume-databases \
+  --target <volume-name> \
+  --snapshot <snapshot-id> \
+  --output /tmp/<db-name>-restore.sql.gz
+
+# Extract only the target table's INSERT statements
+gunzip -c /tmp/<db-name>-restore.sql.gz | \
+  grep -A 1000000 "-- Data for table.*<table-name>" | \
+  grep -B 1000000 "-- Data for table" | \
+  head -n -2 > /tmp/<table-name>-restore.sql
+
+# Restore the table (truncate first to avoid duplicate key errors)
+docker exec -i <postgres-container> psql -U <db-user> -d <db-name> \
+  -c "TRUNCATE TABLE <table-name> CASCADE;"
+docker exec -i <postgres-container> psql -U <db-user> -d <db-name> \
+  < /tmp/<table-name>-restore.sql
+```
+
+<Note>
+  Table-level restores work best for reference or lookup tables. For transactional tables with foreign key dependencies, consult the application team before truncating and restoring — the restore may need to follow a specific table order to satisfy constraint dependencies.
+</Note>
+
+---
+
+## Full Host Restoration
+
+If a Proxmox node itself is unrecoverable (hardware failure, storage failure), a full host restoration reinstalls Proxmox and restores all hosted VMs and containers from PBS.
+
+<Steps>
+  <Step title="Provision or prepare the replacement hardware">
+    Ensure the replacement node has compatible CPU, memory, and storage specifications. Install Proxmox VE from the official ISO onto the replacement hardware using the same major version as the rest of your cluster.
+  </Step>
+  <Step title="Join the replacement node to the cluster">
+    From an existing cluster member, add the new node:
+
+    ```bash
+    pvecm add <existing-node-ip>
+    ```
+
+    Verify the new node joins with quorum intact:
+
+    ```bash
+    pvecm status
+    ```
+  </Step>
+  <Step title="Configure PBS storage on the new node">
+    Add the PBS datastore as a storage backend on the new Proxmox node.
+
+    ```bash
+    pvsh set /storage/<pbs-storage-id> \
+      --server <pbs-host> \
+      --datastore <datastore-name> \
+      --username <pbs-user>@pam \
+      --password <pbs-password>
+    ```
+  </Step>
+  <Step title="Restore VMs and containers in priority order">
+    Restore Tier 1 services first, following the VM or LXC restoration procedures above. Use the service criticality table in the [DR Strategy](/disaster-recovery/strategy) to determine the correct restoration order.
+  </Step>
+  <Step title="Re-apply node configuration">
+    Apply the node's baseline configuration from CHIP's infrastructure-as-code repository to restore network, storage, and monitoring configuration.
+
+    ```bash
+    chip run playbook proxmox-node-baseline \
+      --host <new-node-hostname>
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Post-Restoration Verification Checklist
+
+Complete this checklist after every restoration — partial or full — before declaring the incident resolved.
+
+```
+[ ] Restored VM/container/volume starts without errors
+[ ] Application health check endpoint returns HTTP 200
+[ ] Key application functions verified with the service owner
+[ ] Data at the recovery point is confirmed intact (row counts, file hashes, etc.)
+[ ] No cascading failures observed in dependent services
+[ ] Monitoring shows the restored host/service as healthy (green status in CHIP)
+[ ] Logs reviewed — no error storms or crash loops after restoration
+[ ] CHIP inventory updated with any new VM IDs or container IDs
+[ ] DNS records confirmed correct for the restored service
+[ ] Change ticket updated with recovery point used, actual RTO achieved, and data loss window
+[ ] Service owner has signed off on the restoration
+[ ] Incident post-mortem scheduled (for P1/P2 incidents)
+```
+
+<Info>
+  Record the **actual RTO** achieved in the change ticket and compare it to the RTO target for the service tier. If the actual RTO exceeded the target, open an improvement ticket to identify whether backup frequency, restore automation, or infrastructure changes can close the gap before the next incident.
+</Info>

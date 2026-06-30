@@ -1,0 +1,203 @@
+---
+title: "Alerting Pipeline and On-Call Routing in CHIP"
+sidebarTitle: "Alerting"
+description: "Understand CHIP's alerting pipeline, severity levels, routing rules, and how to create, silence, and manage alert rules using Alertmanager."
+---
+
+CHIP routes all infrastructure alerts through a centralized Alertmanager instance that sits downstream of your Prometheus servers. When a Prometheus rule fires, it forwards the alert to Alertmanager, which applies deduplication, grouping, inhibition, and routing logic before dispatching a notification to the correct channel. This architecture means a single metric threshold can fan out to multiple teams, or a lower-priority alert can be suppressed when a higher-severity parent alert is already firing — preventing your on-call engineers from being overwhelmed during an outage.
+
+## Alert Severity Levels
+
+Every alert rule in CHIP carries a `severity` label that drives both the visual priority in dashboards and the routing logic in Alertmanager.
+
+| Severity | Label Value | Response Expectation | Default Channels |
+|---|---|---|---|
+| **Critical** | `critical` | Immediate response, 24/7 paging | PagerDuty, SMS, Slack `#incidents` |
+| **Warning** | `warning` | Acknowledge within 30 minutes during business hours | Slack `#alerts-warning`, email |
+| **Info** | `info` | No immediate action required; review at next opportunity | Slack `#alerts-info` |
+
+<Note>
+Alert fatigue is one of the leading causes of missed incidents. Before adding a new alert rule, confirm that the threshold you choose reflects a condition that truly requires human attention. Start with a `warning` severity and promote to `critical` only after the alert has proven actionable in at least two real incidents. Regularly audit `info`-level alerts and disable any that never produce meaningful action.
+</Note>
+
+## Notification Channels
+
+CHIP supports the following notification integrations out of the box. Configure them in the control plane under **Observability → Alerting → Receivers**.
+
+- **PagerDuty** — used for all `critical` severity alerts; triggers an incident and pages the on-call rotation
+- **Slack** — three channels: `#incidents` (critical), `#alerts-warning` (warning), `#alerts-info` (info)
+- **Email** — used as a secondary channel for warnings and as a fallback if Slack is unavailable
+- **Webhook** — generic JSON POST for custom integrations (e.g., ticketing systems, ChatOps bots)
+- **OpsGenie** — available as an alternative to PagerDuty for teams using Atlassian tooling
+
+## Routing Rules
+
+Alertmanager routing matches alerts against a tree of rules. CHIP ships a default routing configuration that you can extend. The following summarizes the built-in routing logic:
+
+```yaml
+# Alertmanager routing tree (simplified)
+route:
+  receiver: 'default-slack-warning'
+  group_by: ['alertname', 'env', 'cluster']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - severity = critical
+      receiver: 'pagerduty-critical'
+      continue: true   # also send to Slack #incidents
+    - matchers:
+        - severity = critical
+      receiver: 'slack-incidents'
+    - matchers:
+        - severity = warning
+      receiver: 'slack-alerts-warning'
+    - matchers:
+        - severity = info
+      receiver: 'slack-alerts-info'
+    - matchers:
+        - team = databases
+      receiver: 'dba-oncall'
+      group_by: ['alertname', 'instance']
+```
+
+Team-scoped routing is supported via the `team` label. Any alert that carries a `team` label matching a registered team receiver will be routed to that team's notification channel in addition to the global channel.
+
+## Alert Rules Reference
+
+The following table lists the key built-in alert rules shipped with CHIP. You can view and edit all rules in the control plane under **Observability → Alerting → Rules**.
+
+| Alert Name | Condition | Severity | Notification Channel |
+|---|---|---|---|
+| `NodeDown` | Node unreachable for > 2 min | Critical | PagerDuty, Slack `#incidents` |
+| `TargetDown` | Prometheus target scrape failing > 5 min | Warning | Slack `#alerts-warning` |
+| `HighCPUUsage` | Node CPU > 90% for > 10 min | Warning | Slack `#alerts-warning` |
+| `CriticalCPUUsage` | Node CPU > 98% for > 5 min | Critical | PagerDuty |
+| `DiskSpaceLow` | Filesystem > 80% full | Warning | Slack `#alerts-warning` |
+| `DiskSpaceCritical` | Filesystem > 95% full | Critical | PagerDuty |
+| `HighMemoryPressure` | Available memory < 10% for > 5 min | Warning | Slack `#alerts-warning` |
+| `OOMKillDetected` | Container OOM kill event in last 5 min | Warning | Slack `#alerts-warning` |
+| `ServiceProbeFailure` | Blackbox HTTP probe failing for > 3 min | Critical | PagerDuty |
+| `CertificateExpiryWarning` | TLS certificate expires in < 30 days | Warning | Slack `#alerts-warning` |
+| `CertificateExpiryCritical` | TLS certificate expires in < 7 days | Critical | PagerDuty |
+| `ReplicationLagHigh` | Postgres replication lag > 30s | Warning | Slack `#alerts-warning`, email to DBA team |
+| `KubeDeploymentReplicas` | Deployment available replicas < desired for > 5 min | Warning | Slack `#alerts-warning` |
+| `NetworkErrorRateHigh` | Interface error rate > 0.1% for > 5 min | Warning | Slack `#alerts-warning` |
+
+## Creating a New Alert Rule
+
+<Steps>
+  <Step title="Navigate to the alert rules editor">
+    In the CHIP control plane, go to **Observability → Alerting → Rules**, then click **New Rule**. You can also create rules directly in a `.rules.yml` file in the `chip-config` GitOps repository under `prometheus/rules/`.
+  </Step>
+  <Step title="Write the PromQL expression">
+    Enter the Prometheus query that defines the alert condition. Click **Evaluate** to test the expression against live data and see which time series would currently fire.
+  </Step>
+  <Step title="Set the firing duration (`for`)">
+    Use the **Duration** field to specify how long the condition must be true before the alert fires. A minimum of `2m` is recommended to avoid flapping from transient spikes.
+  </Step>
+  <Step title="Add labels and annotations">
+    Add a `severity` label (`critical`, `warning`, or `info`), a `team` label if the alert belongs to a specific team, and an optional `runbook_url` annotation pointing to your runbook for this alert.
+  </Step>
+  <Step title="Preview and save">
+    Click **Preview Routing** to see which Alertmanager receiver will handle the alert based on its labels. When satisfied, click **Save**. The rule is reloaded into Prometheus within 60 seconds.
+  </Step>
+</Steps>
+
+### Example Alert Rule
+
+```yaml
+# prometheus/rules/chip-node.rules.yml
+
+groups:
+  - name: chip.node
+    interval: 1m
+    rules:
+
+      - alert: HighCPUUsage
+        expr: |
+          (
+            1 - avg by (instance, env) (
+              rate(node_cpu_seconds_total{mode="idle"}[5m])
+            )
+          ) * 100 > 90
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: >
+            CPU utilisation on {{ $labels.instance }} has been above 90% for
+            more than 10 minutes. Current value: {{ $value | humanize }}%.
+          runbook_url: "https://runbooks.internal/chip/high-cpu"
+
+      - alert: CriticalCPUUsage
+        expr: |
+          (
+            1 - avg by (instance, env) (
+              rate(node_cpu_seconds_total{mode="idle"}[5m])
+            )
+          ) * 100 > 98
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Critical CPU saturation on {{ $labels.instance }}"
+          description: >
+            CPU utilisation on {{ $labels.instance }} has exceeded 98% for
+            more than 5 minutes. Immediate investigation required.
+          runbook_url: "https://runbooks.internal/chip/critical-cpu"
+```
+
+## Silencing Alerts During Maintenance
+
+When you schedule planned maintenance on a host or service, create a silence in Alertmanager to suppress notifications for the affected alerts during the maintenance window.
+
+<Steps>
+  <Step title="Open Alertmanager">
+    Navigate to `https://alertmanager.<your-chip-domain>` and log in with your CHIP credentials.
+  </Step>
+  <Step title="Create a new silence">
+    Click **New Silence**. Set the start and end time for your maintenance window. Add matchers that identify the alerts you want to suppress — for example, `instance="db-01.internal"` to silence all alerts for a specific host.
+  </Step>
+  <Step title="Add a comment">
+    Enter a comment explaining the reason for the silence (e.g., "Scheduled kernel upgrade — CHG-4821"). This is mandatory in CHIP and is recorded in the audit log.
+  </Step>
+  <Step title="Submit the silence">
+    Click **Create**. The silence takes effect immediately. You can view, edit, or expire active silences from the **Silences** tab at any time.
+  </Step>
+</Steps>
+
+<Warning>
+Silences suppress notifications but do not prevent alerts from firing in Prometheus. Metrics and alert state are still recorded. When the silence expires, any still-firing alerts will immediately notify the configured channels, so ensure your maintenance is complete before the silence window ends.
+</Warning>
+
+## Acknowledging Alerts
+
+For teams using PagerDuty, acknowledge incidents directly in the PagerDuty web UI or mobile app. For Slack-based alerts, the CHIP bot in `#alerts-warning` supports the following slash commands:
+
+```
+/chip ack <alert-name> <duration> <note>
+# Example: /chip ack HighCPUUsage 2h "Investigating memory leak on worker-03"
+
+/chip silence <matcher> <duration> <note>
+# Example: /chip silence instance=worker-03 4h "Maintenance window CHG-5100"
+```
+
+## On-Call Rotation and Escalation
+
+CHIP integrates with PagerDuty schedules. Escalation tiers are configured per team:
+
+1. **Primary on-call** — first notified via PagerDuty push and phone call
+2. **Secondary on-call** — escalated after 10 minutes if the primary does not acknowledge
+3. **Engineering manager** — escalated after a further 15 minutes with no acknowledgement
+4. **Incident commander** — engaged automatically for any `critical` incident lasting more than 30 minutes
+
+Escalation schedules are maintained in PagerDuty. Coordinate with your team lead to ensure rotation coverage is always up to date before holidays or planned leave periods.
+
+<Tip>
+Link every alert rule to a runbook URL via the `runbook_url` annotation. When an alert fires, the PagerDuty incident and Slack notification will include a direct link to the runbook, reducing the time your on-call engineer spends looking for context during an incident.
+</Tip>

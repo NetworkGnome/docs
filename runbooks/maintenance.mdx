@@ -1,0 +1,429 @@
+---
+title: "Scheduled Maintenance Procedures for CHIP Infrastructure"
+sidebarTitle: "Maintenance"
+description: "Comprehensive maintenance runbooks for Proxmox nodes, OS patching, and Docker image updates, including pre-checks, windows, and rollback steps."
+---
+
+Scheduled maintenance keeps your infrastructure secure, stable, and performing predictably. In CHIP, maintenance is a structured process: every window is ticketed, every change is reversible, and every outcome is verified before the window closes. This page covers the full lifecycle of a maintenance event — from the weekly patching cadence through the post-maintenance verification steps that confirm your environment is healthy before handing back to operations.
+
+<Warning>
+  Never perform maintenance on production infrastructure without an open, approved change ticket. Unticketeted changes cannot be audited, cannot be rolled back through CHIP's change management system, and may violate your organization's compliance requirements. Open your ticket before touching anything.
+</Warning>
+
+---
+
+## Maintenance Calendar
+
+The following table summarizes the standard maintenance schedule for CHIP-managed infrastructure. Exact timing is set per-environment in the CHIP Maintenance Scheduler.
+
+| Cadence | Task | Typical Window | Owner |
+|---|---|---|---|
+| **Weekly** | Docker image vulnerability scan | Sunday 02:00 – 03:00 | Platform Ops |
+| **Weekly** | Log rotation and archive verification | Sunday 03:00 – 03:30 | Platform Ops |
+| **Monthly** | OS package updates (non-Proxmox hosts) | First Saturday 00:00 – 04:00 | Platform Ops |
+| **Monthly** | Docker base image updates | First Saturday 04:00 – 06:00 | Platform Ops |
+| **Monthly** | SSL/TLS certificate review | Last Friday of month | Security |
+| **Quarterly** | Proxmox node updates | Scheduled per environment | Platform Ops |
+| **Quarterly** | Network device firmware updates | Scheduled per environment | Network Ops |
+| **Quarterly** | Disaster recovery drill | Scheduled per DR calendar | Platform Ops |
+| **Annually** | Full infrastructure audit | Scheduled in advance | All teams |
+
+---
+
+## Standard Maintenance Window Procedure
+
+Every maintenance window — regardless of scope — follows this standard sequence. Skipping steps, particularly the pre-maintenance checklist and post-maintenance verification, is the most common cause of undetected issues lingering after a maintenance event.
+
+<Steps>
+  <Step title="Open and link the change ticket">
+    Create a change ticket in your ITSM system with the following information:
+
+    - Maintenance type (e.g., OS patching, Proxmox update)
+    - Target hosts and services
+    - Planned start and end time
+    - Rollback plan summary
+    - On-call contact for the window
+
+    Set the ticket status to **In Progress** when the window begins.
+  </Step>
+  <Step title="Complete the pre-maintenance checklist">
+    Before making any changes, confirm the following:
+
+    - [ ] All affected hosts are visible in CHIP monitoring with a green status
+    - [ ] No active alerts or unacknowledged incidents on target hosts
+    - [ ] Latest backup has completed successfully (check CHIP Backup Status dashboard)
+    - [ ] Rollback artifacts are staged and accessible (snapshots, package version pins)
+    - [ ] Downstream service owners have been notified of the window
+    - [ ] A second operator is available for peer review if the window affects critical services
+  </Step>
+  <Step title="Notify stakeholders">
+    Send a maintenance start notification through your configured CHIP notification channel (Slack, email, or PagerDuty).
+
+    ```bash
+    chip notify maintenance-start \
+      --ticket <ticket-id> \
+      --summary "OS patching: <host-list>" \
+      --eta-minutes <estimated-duration>
+    ```
+  </Step>
+  <Step title="Create pre-change snapshots">
+    For VM-hosted workloads, create a Proxmox snapshot immediately before applying changes.
+
+    ```bash
+    chip snapshot create \
+      --vm <vm-id-or-name> \
+      --label "pre-maintenance-$(date +%Y%m%d)" \
+      --description "Change ticket: <ticket-id>"
+    ```
+
+    For Docker hosts not running inside VMs, commit current container states and back up config directories.
+  </Step>
+  <Step title="Execute the maintenance procedure">
+    Follow the specific maintenance steps for your host type (see the Proxmox or Docker Host tabs below). Document every command you run and any deviations from the expected procedure in your change ticket.
+  </Step>
+  <Step title="Run post-maintenance verification">
+    After applying changes, complete the full post-maintenance verification checklist documented at the end of this page before declaring the window complete.
+  </Step>
+  <Step title="Send the all-clear notification">
+    Notify stakeholders that maintenance has completed and services are healthy.
+
+    ```bash
+    chip notify maintenance-complete \
+      --ticket <ticket-id> \
+      --status <success|partial|failed> \
+      --notes "<brief summary of changes>"
+    ```
+  </Step>
+  <Step title="Close the change ticket">
+    Update the ticket with the actual start/end time, a summary of what was changed, and the outcome of the post-maintenance verification. Set the status to **Closed — Successful** or **Closed — With Issues** as appropriate.
+  </Step>
+</Steps>
+
+---
+
+## Host-Specific Maintenance Procedures
+
+<Tabs>
+  <Tab title="Proxmox Node Maintenance">
+
+    Proxmox node updates include Proxmox VE package upgrades, kernel updates, and firmware patches. Because Proxmox nodes run your VM and container workloads, the migration and reboot sequence is the most critical part of this procedure.
+
+    ### Before You Start
+
+    Proxmox maintenance requires that all VMs and containers on the target node are either migrated to another node or cleanly shut down. Do not perform rolling maintenance on a single-node cluster without a full downtime window.
+
+    <Note>
+      If your Proxmox environment is a single node (non-clustered), all workloads will be offline during the maintenance window. Confirm this is acceptable with stakeholders before scheduling.
+    </Note>
+
+    ### Proxmox Node Update Steps
+
+    **1. Migrate or shut down workloads**
+
+    For each VM and container on the target node, migrate to another healthy node if available:
+
+    ```bash
+    # Live migrate a running VM to another node
+    pvesh create /nodes/<source-node>/qemu/<vmid>/migrate \
+      --target <destination-node> \
+      --online 1
+
+    # Live migrate a container
+    pvesh create /nodes/<source-node>/lxc/<ctid>/migrate \
+      --target <destination-node> \
+      --restart 1
+    ```
+
+    Alternatively, shut down workloads gracefully if migration is not available:
+
+    ```bash
+    qm shutdown <vmid> --timeout 120
+    pct shutdown <ctid> --timeout 60
+    ```
+
+    **2. Update the Proxmox package lists**
+
+    ```bash
+    apt update
+    ```
+
+    Review the list of packages with available upgrades:
+
+    ```bash
+    apt list --upgradable 2>/dev/null | grep -E "proxmox|pve|ceph"
+    ```
+
+    **3. Apply updates**
+
+    ```bash
+    apt dist-upgrade -y
+    ```
+
+    Monitor the output carefully. If the upgrade prompts for config file decisions (`keep` vs `replace`), consult your site configuration documentation before choosing.
+
+    **4. Reboot the node**
+
+    ```bash
+    systemctl reboot
+    ```
+
+    Monitor the node's boot from the Proxmox console. Wait for the node to fully rejoin the cluster before proceeding.
+
+    **5. Verify cluster health**
+
+    ```bash
+    pvecm status
+    pvecm nodes
+    ```
+
+    All nodes should show as `online`. Quorum should be maintained.
+
+    **6. Restore workloads**
+
+    Migrate VMs and containers back to the updated node, or start any workloads that were shut down:
+
+    ```bash
+    qm start <vmid>
+    pct start <ctid>
+    ```
+
+    ### Rollback Procedure
+
+    If a Proxmox update causes instability, boot the node into the previous kernel from the GRUB menu, or restore from the node snapshot taken in step 4 of the Standard Window Procedure.
+
+    ```bash
+    # List available kernels
+    dpkg --list | grep pve-kernel
+
+    # Pin the previous kernel as default
+    proxmox-boot-tool kernel pin <previous-kernel-version>
+    proxmox-boot-tool refresh
+    ```
+
+  </Tab>
+  <Tab title="Docker Host Maintenance">
+
+    Docker host maintenance covers OS-level package updates and Docker Engine upgrades on hosts running CHIP-managed container workloads. The key concern is minimizing container downtime and avoiding Docker daemon restarts that drop active containers.
+
+    ### Before You Start
+
+    Confirm the Docker host is not running `--live-restore=false`. CHIP default configuration sets `live-restore: true` in `/etc/docker/daemon.json`, which allows containers to keep running during a Docker daemon restart. Verify this before proceeding:
+
+    ```bash
+    docker info | grep -i "live restore"
+    # Expected: Live Restore Enabled: true
+    ```
+
+    <Warning>
+      If `Live Restore` is **not** enabled, containers will stop when the Docker daemon restarts. In this case, plan for container downtime and notify service owners before proceeding.
+    </Warning>
+
+    ### OS Package Update Steps
+
+    **1. Check for available updates and review**
+
+    ```bash
+    sudo apt update
+    apt list --upgradable 2>/dev/null
+    ```
+
+    Identify any kernel updates. A kernel update requires a reboot — schedule a reboot window with service owners if the host is running critical containers.
+
+    **2. Apply non-kernel updates**
+
+    If you want to defer the reboot, apply all updates except the kernel:
+
+    ```bash
+    sudo apt-get upgrade -y --without-new-pkgs
+    ```
+
+    To include all updates (and schedule a reboot):
+
+    ```bash
+    sudo apt dist-upgrade -y
+    ```
+
+    **3. Update the Docker Engine (if a new version is available)**
+
+    ```bash
+    sudo apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io
+
+    # Restart the Docker daemon (containers remain running with live-restore)
+    sudo systemctl restart docker
+
+    # Verify Docker version
+    docker version
+    ```
+
+    **4. Reboot the host (if kernel was updated)**
+
+    Before rebooting, verify all containers will restart automatically by checking their restart policies:
+
+    ```bash
+    docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Labels}}" | grep -v restart
+    ```
+
+    All production containers should have `restart: unless-stopped` or `restart: always` configured. Containers without a restart policy will **not** start automatically after a reboot.
+
+    ```bash
+    sudo systemctl reboot
+    ```
+
+    After the host reboots, allow 3-5 minutes for all containers to start, then verify:
+
+    ```bash
+    docker ps --format "table {{.Names}}\t{{.Status}}"
+    ```
+
+    ### Docker Image Updates
+
+    Updating Docker images is separate from host OS updates and follows its own procedure to ensure rollback capability.
+
+    **1. Pull the updated image without removing the current one**
+
+    ```bash
+    docker pull <registry>/<image-name>:<new-tag>
+    ```
+
+    **2. Recreate the container with the new image**
+
+    ```bash
+    # For Compose-managed services
+    docker compose pull <service-name>
+    docker compose up -d --no-deps <service-name>
+
+    # For Swarm services
+    docker service update --image <registry>/<image-name>:<new-tag> <stack>_<service>
+    ```
+
+    **3. Verify the new container is healthy, then clean up the old image**
+
+    ```bash
+    docker inspect --format='{{.State.Health.Status}}' <container-name>
+    # Wait for: healthy
+
+    # Remove old image only after confirming new container is stable for 15+ minutes
+    docker image prune -f
+    ```
+
+    ### Rollback Procedure
+
+    Roll back to the previous image tag if the updated container is unhealthy:
+
+    ```bash
+    # Compose
+    docker compose up -d --no-deps --image <registry>/<image-name>:<previous-tag> <service-name>
+
+    # Swarm
+    docker service rollback <stack>_<service>
+    ```
+
+  </Tab>
+</Tabs>
+
+---
+
+## Pre-Maintenance Checklist Reference
+
+Use this checklist for every maintenance window. Copy it into your change ticket and check each item before proceeding.
+
+```
+[ ] Change ticket is open, approved, and linked to this session
+[ ] All target hosts show healthy status in CHIP monitoring
+[ ] No open P1/P2 incidents affecting target hosts
+[ ] Backup completed successfully within the last 24 hours (verify in CHIP Backup Status)
+[ ] Pre-change snapshots created and verified
+[ ] Rollback procedure reviewed and staged
+[ ] Downstream service owners notified (record confirmation)
+[ ] Maintenance start notification sent
+[ ] Second operator confirmed available (for critical-tier services)
+```
+
+---
+
+## Post-Maintenance Verification
+
+After completing maintenance steps, verify the environment is fully healthy before closing the window.
+
+<Steps>
+  <Step title="Confirm all services are running">
+    In the CHIP dashboard, navigate to **Services → All Services** and confirm every service that was running before the maintenance window shows a green status.
+  </Step>
+  <Step title="Check the monitoring dashboard for new alerts">
+    Review **Monitoring → Alerts** for any alerts that fired during or after the maintenance window. Investigate and resolve any unexpected alerts before closing the ticket.
+  </Step>
+  <Step title="Verify system metrics are within baseline">
+    Check CPU, memory, and disk I/O metrics on each maintained host. Post-update metrics should be within ±10% of the pre-maintenance baseline.
+
+    ```bash
+    chip metrics snapshot --host <hostname> --compare pre-maintenance
+    ```
+  </Step>
+  <Step title="Run the post-maintenance smoke test suite">
+    Execute CHIP's built-in post-maintenance checks against the target hosts.
+
+    ```bash
+    chip health check --host <hostname> --suite post-maintenance
+    ```
+
+    All checks must pass before the window is declared complete.
+  </Step>
+  <Step title="Delete pre-change snapshots (after 48-hour hold)">
+    Do not delete pre-maintenance snapshots immediately. Hold them for 48 hours to allow any latent issues to surface. After the hold period, remove them to free storage.
+
+    ```bash
+    chip snapshot delete \
+      --label "pre-maintenance-$(date -d '2 days ago' +%Y%m%d)" \
+      --confirm
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Communication Templates
+
+CHIP provides pre-built notification templates for maintenance events. Use these to ensure consistent communication with stakeholders.
+
+<Accordion title="Maintenance Announcement Template">
+
+  Use this template at least 48 hours before a planned maintenance window:
+
+  ```
+  Subject: [CHIP Maintenance] <Brief Description> — <Date>, <Time Window>
+
+  Team,
+
+  We will be performing scheduled maintenance on the following infrastructure:
+  - Target: <host or service list>
+  - Window: <start time> – <end time> (<timezone>)
+  - Impact: <describe expected downtime or degradation, or "No user-facing impact expected">
+  - Change Ticket: <ticket-id>
+
+  If you have concerns about this maintenance window, please reply by <deadline> so we can
+  reschedule if necessary.
+
+  On-call during window: <name> (<contact>)
+  ```
+
+</Accordion>
+
+<Accordion title="Maintenance Complete Template">
+
+  Send this notification within 15 minutes of completing the maintenance window:
+
+  ```
+  Subject: [CHIP Maintenance Complete] <Brief Description> — <Date>
+
+  Team,
+
+  Maintenance has completed successfully.
+  - Completed at: <actual end time>
+  - Changes applied: <brief summary>
+  - Verification status: All post-maintenance checks passed
+  - Change Ticket: <ticket-id> (now closed)
+
+  If you observe any unexpected behavior, please contact on-call: <name> (<contact>)
+  ```
+
+</Accordion>

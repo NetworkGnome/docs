@@ -1,0 +1,175 @@
+---
+title: "Change Management: Planning, Approval & Execution"
+sidebarTitle: "Change Management"
+description: "Understand how CHIP infrastructure changes are classified, approved, scheduled, and executed — including rollback criteria and post-change requirements."
+---
+
+Every modification to CHIP's production infrastructure — whether a configuration update, software upgrade, or network change — goes through a defined change management process. This process exists not to create friction, but to ensure that changes are intentional, reviewed, reversible, and communicated to the people who depend on that infrastructure. Unplanned or undocumented changes are the leading cause of incidents that are difficult to diagnose and recover from. By following the change management process, you protect both the platform and your team.
+
+## Change Types
+
+CHIP recognizes three categories of change, each with different risk profiles, approval requirements, and lead times:
+
+| Type | Risk Level | Approval Required | Lead Time | Change Window | Rollback Window |
+|---|---|---|---|---|---|
+| **Standard** | Low | Peer review (1 approver) | 24 hours | Scheduled maintenance window | 48 hours |
+| **Normal** | Medium–High | Team lead + peer review | 72 hours | Scheduled maintenance window | 7 days |
+| **Emergency** | Variable | On-call lead (post-hoc review required) | Immediate | Any time | Immediate |
+
+### Standard Changes
+
+Standard changes are low-risk, well-understood modifications with a defined procedure and a tested rollback path. Examples include:
+
+- Applying routine OS patches during scheduled maintenance
+- Updating a Docker image to a new minor version
+- Adding a new DNS record
+- Rotating a TLS certificate
+- Adding monitoring thresholds or alert rules
+
+Standard changes require a peer review of the proposed change (pull request approval) and must be executed during a scheduled maintenance window unless otherwise approved.
+
+### Normal Changes
+
+Normal changes carry medium to high risk, involve significant configuration changes, affect multiple systems, or have untested outcomes. Examples include:
+
+- Major version upgrades of database or infrastructure software
+- Changes to network topology or VLAN configuration
+- Adding or removing Proxmox cluster nodes
+- Modifications to firewall rules or security group policies
+- Changes to backup and recovery configuration
+
+Normal changes require both a team lead review and a peer technical review. They must be accompanied by a written rollback plan and a verification checklist.
+
+### Emergency Changes
+
+Emergency changes are made outside the normal process to restore service or prevent imminent impact. They are the exception, not the rule. Using emergency change classification for planned work is a process violation.
+
+<Warning>
+Emergency changes bypass normal review requirements and can be executed immediately by the on-call engineer. However, every emergency change **must** be followed within 24 hours by a post-change review, documentation update, and a retrospective entry explaining why the emergency classification was necessary. Repeated emergency changes for the same system are an indicator of systemic process failure.
+</Warning>
+
+## Standard Change Workflow
+
+For most infrastructure changes, you will follow the standard change workflow:
+
+<Steps>
+  <Step title="Document the proposed change">
+    Before writing any code or running any commands, write down what you intend to change, why, what the expected outcome is, and how you will verify success. This document becomes the change record.
+
+    Create a change record in the `changes/` directory using the template:
+
+    ```bash
+    cp changes/templates/change-record.md \
+       changes/$(date +%Y%m%d)-short-description.md
+    ```
+
+    The change record must include:
+    - **What** is changing (specific resources, configurations, versions)
+    - **Why** the change is needed (link to ticket or incident if applicable)
+    - **Impact** assessment (services affected, expected downtime)
+    - **Rollback plan** (exact steps to revert, rollback decision criteria)
+    - **Verification steps** (how you will confirm the change succeeded)
+  </Step>
+  <Step title="Prepare and test the automation">
+    Make the change in a feature branch. Run your Ansible playbook or script against the staging environment. Confirm the outcome matches expectations. Document any surprises or deviations from the plan.
+
+    ```bash
+    git checkout -b change/update-postgres-14-to-15
+    # Make your changes
+    ansible-playbook -i inventory/staging playbooks/upgrade-postgres.yml --check --diff
+    ansible-playbook -i inventory/staging playbooks/upgrade-postgres.yml
+    # Verify staging is healthy
+    ```
+  </Step>
+  <Step title="Open a pull request and request review">
+    Open a pull request that includes both the automation changes and the change record document. Tag the appropriate reviewer based on the change type. Add the `change:standard` or `change:normal` label to the PR.
+
+    Your PR description should summarize the change, link to the change record, and note the target maintenance window.
+  </Step>
+  <Step title="Schedule the maintenance window">
+    Book a maintenance window in the shared infrastructure calendar. The window must be long enough to execute the change and complete verification, plus buffer time for rollback if needed. Notify affected service owners via the `#infrastructure-changes` Slack channel at least 24 hours in advance.
+
+    <Tip>
+    Consult the maintenance runbook for the affected system before the change window. It contains system-specific pre-checks, known failure modes, and escalation contacts that are easy to miss under pressure.
+    </Tip>
+  </Step>
+  <Step title="Execute during the change window">
+    At the start of the maintenance window, confirm that the system is in the expected state before beginning. Run your automation, monitor progress, and compare outcomes against the verification checklist in your change record.
+
+    ```bash
+    # Confirm pre-change state
+    ansible-playbook -i inventory/production playbooks/upgrade-postgres.yml --check
+
+    # Execute
+    ansible-playbook -i inventory/production playbooks/upgrade-postgres.yml
+
+    # Run post-change verification
+    ./automation/scripts/bash/service-healthcheck.sh --env production
+    ```
+  </Step>
+  <Step title="Verify and close the change record">
+    After the change window, work through every item in your verification checklist. Check monitoring dashboards for anomalies. Confirm alerting is healthy. If verification passes, mark the change record as complete with the actual outcome and any notes. Merge the PR.
+
+    If verification fails and rollback criteria are met, execute the rollback plan immediately — do not attempt to fix forward during a change window without explicit team lead approval.
+  </Step>
+</Steps>
+
+## Change Window Scheduling
+
+### Standard Maintenance Windows
+
+CHIP has two recurring maintenance windows per week. Standard and normal changes should be scheduled within these windows:
+
+| Window | Day | Time | Duration | Typical Use |
+|---|---|---|---|---|
+| **Primary** | Tuesday | 22:00–02:00 UTC | 4 hours | OS updates, software upgrades, config changes |
+| **Secondary** | Saturday | 06:00–10:00 UTC | 4 hours | Network changes, storage operations, cluster maintenance |
+
+### Requesting an Off-Cycle Window
+
+If a change cannot wait for the next standard window, request an off-cycle window by posting in `#infrastructure-changes` with the following information: the change type, estimated duration, affected services, and reason the scheduled window cannot be used. Off-cycle windows require team lead approval.
+
+## Rollback Criteria
+
+Begin rollback immediately if any of the following conditions are met after a change:
+
+- A production service is returning errors that did not exist before the change
+- Monitoring dashboards show elevated error rates, latency, or resource utilization above defined thresholds
+- A dependent team reports service degradation
+- The change cannot be verified as complete within the maintenance window timeframe
+- The system enters an unknown state that the operator cannot explain
+
+Do not attempt to diagnose and fix a failing change during the maintenance window unless the fix is trivial and can be completed with high confidence. Roll back first — restore service, then diagnose in non-production.
+
+## Communication Requirements
+
+### Before a Change
+
+- Post in `#infrastructure-changes` at least 24 hours before standard changes, 72 hours before normal changes
+- Tag affected service owners directly if the change may cause downtime
+- Include: change type, affected systems, expected impact, maintenance window time
+
+### During a Change
+
+- Post a start notification in `#infrastructure-changes` when the maintenance window opens
+- Post status updates if the change is taking longer than planned
+- Escalate to team lead if you encounter unexpected behavior
+
+### After a Change
+
+- Post a completion summary in `#infrastructure-changes` (success or rollback)
+- Update the change record with the actual outcome
+- If a rollback was performed, open a follow-up ticket to address the root cause
+
+## Post-Change Requirements
+
+Every completed change — whether it succeeded or was rolled back — must result in:
+
+1. **Updated change record** with actual outcome, duration, and any deviations from the plan
+2. **Documentation update** if the change altered the infrastructure configuration, architecture, or operational procedures
+3. **Monitoring validation** confirming that all relevant dashboards and alerts reflect the post-change state correctly
+4. **Ticket closure** with a link to the merged PR and change record
+
+<Info>
+Changes that alter infrastructure state without a corresponding documentation update are treated as incomplete. The infrastructure documentation in CHIP is the source of truth — if the docs don't reflect reality, the docs need to be fixed before the change is considered closed.
+</Info>

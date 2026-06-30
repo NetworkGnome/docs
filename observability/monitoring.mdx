@@ -1,0 +1,150 @@
+---
+title: "Infrastructure Monitoring with CHIP Observability Stack"
+sidebarTitle: "Monitoring"
+description: "Monitor nodes, VMs, containers, and services using CHIP's Prometheus and Grafana stack. Learn how to add targets, explore dashboards, and expose custom metrics."
+---
+
+CHIP's monitoring stack gives you continuous, real-time visibility across every layer of your infrastructure. Powered by Prometheus for metric collection and Grafana for visualization, the platform automatically scrapes registered targets on a defined interval, stores time-series data with configurable retention, and surfaces pre-built dashboards for the most common operational views. Whether you are triaging a production incident or planning capacity, the monitoring stack is your primary source of truth for the current and historical state of your environment.
+
+## What Gets Monitored
+
+CHIP monitors four broad categories of infrastructure resources. Each category has one or more exporters responsible for surfacing metrics in the Prometheus exposition format.
+
+| Target | Exporter | Port | Metrics Collected |
+|---|---|---|---|
+| Bare-metal nodes & VMs | `node_exporter` | `9100` | CPU, memory, disk I/O, filesystem, network interface stats |
+| Containers (Docker / containerd) | `cAdvisor` | `8080` | Container CPU, memory, network, throttle, OOM events |
+| Kubernetes workloads | `kube-state-metrics` | `8443` | Pod phase, deployment replicas, resource requests/limits |
+| Network devices (switches, routers) | `snmp_exporter` | `9116` | Interface errors, bandwidth utilization, LLDP topology |
+| PostgreSQL databases | `postgres_exporter` | `9187` | Query latency, connection pool, replication lag |
+| Redis instances | `redis_exporter` | `9121` | Hit rate, memory fragmentation, command latency |
+| HTTP services (black-box) | `blackbox_exporter` | `9115` | Probe success, HTTP status codes, TLS expiry, latency |
+| IPMI / hardware health | `ipmi_exporter` | `9290` | Temperatures, fan speeds, power consumption, hardware faults |
+
+### Scrape Intervals and Retention
+
+Prometheus is configured with tiered scrape intervals to balance freshness against storage cost:
+
+- **Default interval:** `15s` for most targets
+- **High-frequency targets** (e.g., network devices, blackbox probes): `30s`
+- **Long-horizon metrics** (e.g., capacity planning aggregates): pre-aggregated via recording rules and stored in a separate Prometheus instance with a **365-day** retention
+
+Raw metric retention on the primary Prometheus instance is **90 days**. Data older than 90 days is compacted and remote-written to a long-term storage backend (Thanos or VictoriaMetrics, depending on your deployment tier).
+
+<Info>
+Scrape intervals and retention values can be overridden per-target in the CHIP control plane under **Settings → Observability → Prometheus**. Changes take effect on the next Prometheus reload, which CHIP triggers automatically after saving.
+</Info>
+
+## Grafana Dashboards
+
+CHIP ships a curated set of Grafana dashboards that are version-controlled alongside the platform configuration. Dashboards are provisioned automatically and are read-only by default to prevent configuration drift. You can duplicate any built-in dashboard to create your own custom variants.
+
+| Dashboard Name | UID | Description |
+|---|---|---|
+| Node Overview | `chip-node-overview` | Per-host CPU, memory, disk, and network at a glance |
+| Network Fabric | `chip-network-fabric` | Interface utilization, error rates, and LLDP topology |
+| Storage Health | `chip-storage-health` | Disk saturation, I/O latency, filesystem fill rates |
+| Kubernetes Cluster | `chip-k8s-cluster` | Workload health, resource pressure, HPA activity |
+| Service Blackbox | `chip-blackbox` | HTTP/TCP probe results, latency heatmaps, TLS expiry |
+| Database Performance | `chip-databases` | Query latency percentiles, connection counts, replication lag |
+| Platform Overview | `chip-platform` | Top-level SLI/SLO status across all services |
+
+### Accessing Grafana
+
+<Steps>
+  <Step title="Navigate to the Grafana endpoint">
+    Open your browser and go to `https://grafana.<your-chip-domain>`. You will be redirected to the CHIP SSO login page if you are not already authenticated.
+  </Step>
+  <Step title="Log in with your CHIP identity">
+    Use your standard CHIP credentials. Grafana respects CHIP RBAC roles — operators with the `Viewer` role can browse all dashboards, while `Editor` and `Admin` roles can also modify or create dashboards.
+  </Step>
+  <Step title="Open the dashboard browser">
+    Click the **Dashboards** icon (four squares) in the left sidebar, then select **Browse**. All CHIP-provisioned dashboards live in the `CHIP / Infrastructure` folder.
+  </Step>
+  <Step title="Select a dashboard and set the time range">
+    Click the dashboard you want to view. Use the time picker in the top-right corner to select a range (e.g., `Last 6 hours`, `Last 7 days`). Hold `Shift` and click on a panel to drill down into a specific time window.
+  </Step>
+  <Step title="Filter by host or environment">
+    Most dashboards include a top-of-page variable row. Use the **Environment**, **Cluster**, or **Host** dropdowns to scope the view to the resources you are investigating.
+  </Step>
+</Steps>
+
+<Tip>
+Press `d` then `k` in Grafana to open the keyboard shortcuts overlay. Shortcuts like `g` + `h` (go to home), `Ctrl+F` (find panels), and `e` (toggle panel edit) significantly speed up dashboard navigation.
+</Tip>
+
+## Adding a New Monitoring Target
+
+CHIP uses a service-discovery-backed Prometheus configuration. You register targets in the CHIP control plane rather than editing raw `prometheus.yml` files.
+
+<Steps>
+  <Step title="Open the target registry">
+    In the CHIP control plane, navigate to **Observability → Monitoring → Targets**, then click **Add Target**.
+  </Step>
+  <Step title="Fill in target details">
+    Provide the following fields:
+
+    | Field | Description |
+    |---|---|
+    | **Label** | A human-readable name for the target |
+    | **Address** | Hostname or IP and port (e.g., `db-01.internal:9187`) |
+    | **Exporter** | Select the exporter type from the dropdown |
+    | **Scrape interval** | Override the default `15s` if needed |
+    | **Labels** | Key-value pairs added to all metrics from this target (e.g., `env=prod`, `team=platform`) |
+  </Step>
+  <Step title="Verify the target is reachable">
+    Click **Test Connection**. CHIP attempts a single scrape and shows you the first 20 metrics returned. Fix any network or firewall issues before saving.
+  </Step>
+  <Step title="Save and confirm in Prometheus">
+    Click **Save**. Within 60 seconds, open `https://prometheus.<your-chip-domain>/targets` and confirm the new target appears in the **UP** state.
+  </Step>
+</Steps>
+
+<Warning>
+Targets in a **DOWN** state for more than 5 minutes will trigger the `TargetDown` alert rule, which pages the on-call engineer. Resolve connectivity issues before adding targets to prevent alert noise during onboarding.
+</Warning>
+
+## Custom Metrics
+
+Applications that instrument themselves with a Prometheus client library can expose metrics on a `/metrics` endpoint and be registered as a target using the same steps above. CHIP supports the standard Prometheus text format and OpenMetrics format.
+
+```yaml
+# Example: Prometheus scrape config for a custom application
+# (Applied automatically by CHIP when you register a target)
+- job_name: 'my-app'
+  static_configs:
+    - targets: ['my-app.internal:8080']
+  metrics_path: '/metrics'
+  scheme: 'https'
+  tls_config:
+    ca_file: /etc/chip/ca/chip-internal-ca.pem
+  relabel_configs:
+    - source_labels: [__address__]
+      target_label: instance
+    - target_label: env
+      replacement: production
+```
+
+If your application cannot expose a `/metrics` endpoint directly, use a **push gateway** for short-lived jobs:
+
+```bash
+# Push a metric to the CHIP Pushgateway from a batch job
+echo "batch_job_duration_seconds $(date +%s%N | head -c10)" | \
+  curl --data-binary @- \
+  https://pushgateway.<your-chip-domain>/metrics/job/nightly_backup/instance/$(hostname)
+```
+
+<Note>
+Push gateway metrics are not subject to the `TargetDown` alerting rule. For long-running services, always prefer a pull-based scrape target over the push gateway.
+</Note>
+
+## Related Observability Docs
+
+<CardGroup cols={2}>
+  <Card title="Alerting" icon="bell" href="/observability/alerting">
+    Configure alert rules, notification channels, routing, and on-call escalation policies.
+  </Card>
+  <Card title="Logging" icon="scroll" href="/observability/logging">
+    Explore log aggregation with Loki, search logs, and set up log-based alerts.
+  </Card>
+</CardGroup>

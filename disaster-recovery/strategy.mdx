@@ -1,0 +1,160 @@
+---
+title: "Disaster Recovery Strategy and Objectives for CHIP"
+sidebarTitle: "Strategy"
+description: "Understand CHIP's disaster recovery framework, RTO/RPO targets, service criticality tiers, DR scenarios, and testing cadence to prepare your team."
+---
+
+Disaster recovery in CHIP is not a single procedure — it is a tiered framework that matches recovery investment to service criticality. Not every service needs to recover in minutes, and not every failure scenario requires the same response. This strategy document defines the objectives, classifications, and processes that govern how your team responds when infrastructure fails, data is lost, or an entire site becomes unavailable. Understanding this framework is the starting point before using any of the specific backup or restoration runbooks.
+
+<Note>
+  This document describes the reference DR strategy for CHIP-managed environments. Your organization may apply different RTO/RPO targets based on contractual SLAs, regulatory requirements, or risk tolerance. Review this strategy with your stakeholders annually and update targets when they change. A DR strategy that no one has reviewed in two years is not a strategy — it is a liability.
+</Note>
+
+---
+
+## Recovery Objectives
+
+CHIP's DR strategy is governed by two core metrics that define the limits of acceptable data loss and downtime for each service tier.
+
+| Metric | Definition | How It's Set |
+|---|---|---|
+| **RTO** (Recovery Time Objective) | Maximum acceptable time for a service to be restored after a failure event | Set per service based on business impact assessment |
+| **RPO** (Recovery Point Objective) | Maximum acceptable amount of data loss, expressed as a time window | Set per service based on data criticality and backup frequency |
+
+These objectives drive decisions about backup frequency, replication topology, and the infrastructure redundancy required for each service tier.
+
+---
+
+## Service Criticality Tiers
+
+All services managed by CHIP are classified into one of three tiers based on their impact to operations if unavailable.
+
+### Tier Definitions
+
+**Tier 1 — Critical:** Services whose unavailability immediately impacts production operations or revenue. These services require the shortest RTO and RPO, and may require active-active or warm-standby configurations.
+
+**Tier 2 — Important:** Services that support operations but can tolerate several hours of downtime. Failures cause significant inconvenience or degradation but are not immediately catastrophic.
+
+**Tier 3 — Standard:** Internal tools, development environments, and non-customer-facing services where downtime is acceptable for 24 hours or more.
+
+### Service Criticality Reference Table
+
+| Service | Tier | RTO | RPO | Recovery Method |
+|---|---|---|---|---|
+| Core API Gateway | 1 | 15 min | 5 min | Warm standby + PBS snapshot |
+| Primary Database (PostgreSQL) | 1 | 30 min | 5 min | Streaming replica + PBS snapshot |
+| Authentication Service | 1 | 15 min | 15 min | PBS snapshot + container redeploy |
+| Message Queue (RabbitMQ) | 1 | 30 min | 15 min | PBS snapshot + volume restore |
+| Monitoring Stack (Prometheus/Grafana) | 2 | 2 hours | 1 hour | PBS snapshot |
+| CI/CD Platform | 2 | 4 hours | 1 hour | PBS snapshot |
+| Internal Wiki / Documentation | 2 | 4 hours | 4 hours | PBS snapshot + daily backup |
+| Log Aggregation (Loki) | 2 | 4 hours | 24 hours | PBS snapshot |
+| Dev/Staging Environments | 3 | 24 hours | 24 hours | PBS snapshot |
+| Internal Admin Tools | 3 | 24 hours | 24 hours | PBS snapshot |
+| Test Infrastructure | 3 | 48 hours | 48 hours | PBS snapshot |
+
+<Tip>
+  Review this table with service owners at least quarterly. A service that was Tier 3 when first onboarded may have grown into a Tier 1 dependency without the classification being updated. Incorrect tier assignments lead to misconfigured backup schedules and missed RTO targets during a real incident.
+</Tip>
+
+---
+
+## Disaster Recovery Scenarios
+
+CHIP's DR framework addresses four primary failure scenarios. Each scenario has a distinct response path and recovery playbook.
+
+<CardGroup cols={2}>
+  <Card title="Single Node Failure" icon="server">
+    A Proxmox compute node becomes unavailable due to hardware failure, kernel panic, or storage fault. Workloads must be restored from backup or migrated to surviving cluster nodes.
+  </Card>
+  <Card title="Full Site Failure" icon="building-xmark">
+    The entire primary data center or colocation facility becomes unavailable due to power loss, network outage, or physical disaster. Recovery requires activating the offsite DR environment.
+  </Card>
+  <Card title="Data Corruption" icon="triangle-exclamation">
+    Application data is corrupted due to a software bug, failed migration, or human error. Recovery requires restoring from a known-good backup point-in-time snapshot.
+  </Card>
+  <Card title="Ransomware / Security Incident" icon="lock">
+    A security incident results in encrypted or deleted data, or compromised infrastructure. Recovery requires restoring from air-gapped or immutable offsite backups after the environment is secured.
+  </Card>
+</CardGroup>
+
+### Single Node Failure Response
+
+1. CHIP monitoring triggers a P1 alert when a node becomes unreachable for more than 2 minutes.
+2. On-call engineer confirms the node failure via the Proxmox cluster dashboard.
+3. If the cluster has quorum and other nodes are healthy, trigger HA failover for Tier 1 VMs:
+   ```bash
+   ha-manager set vm:<vmid> --state started --node <surviving-node>
+   ```
+4. For nodes without HA configured, restore from PBS backup using the [VM Restoration runbook](/disaster-recovery/restoration).
+5. Once the failed node is repaired and rejoins the cluster, migrate workloads back during the next maintenance window.
+
+### Full Site Failure Response
+
+1. Confirm the outage is a full site failure, not a single-node issue (contact the facility NOC or hosting provider).
+2. Activate the DR site runbook and notify all stakeholders of the failover.
+3. Provision infrastructure at the DR site from CHIP's infrastructure-as-code repository.
+4. Restore Tier 1 services from offsite backup replicas in RTO order (shortest RTO first).
+5. Update DNS to point services at the DR site addresses.
+6. Operate from DR site until primary site is restored. Document all changes made during DR operation.
+7. Plan a formal failback window once the primary site is confirmed stable.
+
+### Data Corruption Response
+
+1. Identify the scope of corruption — which datasets, volumes, or databases are affected.
+2. Stop writes to the affected system immediately to prevent the corruption window from expanding.
+3. Identify the most recent known-good backup prior to the corruption event.
+4. Follow the [Restoration runbook](/disaster-recovery/restoration) for the appropriate component type.
+5. If only a subset of data is corrupted, use the partial restore procedure to minimize data loss.
+6. After restoration, verify data integrity with the application owner before resuming writes.
+
+### Ransomware / Security Incident Response
+
+<Warning>
+  If a ransomware or security incident is suspected, do **not** attempt to restore from any backup that was connected to the compromised infrastructure. Ransomware can pre-stage payloads in backup data before triggering encryption. Engage your security incident response team before performing any recovery actions.
+</Warning>
+
+1. Isolate all affected systems from the network immediately.
+2. Engage the security incident response team and open a security incident ticket.
+3. Identify the infection vector and scope before beginning recovery.
+4. Restore only from backups that are confirmed to pre-date the infection and are stored in an immutable or air-gapped location.
+5. Rebuild compromised hosts from a clean OS baseline rather than restoring them in-place.
+6. Conduct a post-incident review before returning systems to production.
+
+---
+
+## DR Testing Cadence
+
+A DR strategy that is never tested is not a working DR strategy. CHIP mandates regular DR drills at the following cadence:
+
+| Test Type | Frequency | Scope | Owner |
+|---|---|---|---|
+| Backup restoration test | Monthly | One randomly selected VM per tier | Platform Ops |
+| Single-node failover drill | Quarterly | One Proxmox node per cluster | Platform Ops |
+| Full DR site activation | Annually | All Tier 1 services | Platform Ops + Security |
+| Tabletop exercise | Semi-annually | Full team walkthrough of DR scenarios | All teams |
+
+### Test Documentation Requirements
+
+Every DR test must produce a written record containing:
+
+- Date and participants
+- Scenario tested
+- Actual RTO and RPO achieved vs. target
+- Issues encountered and resolutions
+- Action items for closing gaps
+
+Store test records in the CHIP documentation repository and link them to the DR strategy document so the last test results are always visible. If a drill reveals that an RTO or RPO target cannot be met with current infrastructure, open a capacity or architecture improvement ticket immediately.
+
+---
+
+## DR Resources
+
+<CardGroup cols={2}>
+  <Card title="Backup Architecture" icon="database" href="/disaster-recovery/backups">
+    Detailed documentation of all backup jobs, schedules, retention policies, storage locations, and monitoring configuration.
+  </Card>
+  <Card title="Restoration Procedures" icon="rotate-left" href="/disaster-recovery/restoration">
+    Step-by-step restoration runbooks for VMs, LXC containers, and Docker volumes, including partial and full-host recovery flows.
+  </Card>
+</CardGroup>

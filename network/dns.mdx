@@ -1,0 +1,286 @@
+---
+title: "DNS Architecture and Record Management in CHIP"
+sidebarTitle: "DNS"
+description: "Understand CHIP's split-horizon DNS architecture, internal zone structure, resolver configuration per VLAN, and how to manage DNS records."
+---
+
+CHIP's DNS infrastructure provides reliable, zone-aware name resolution for all workloads running on the platform. Rather than relying on a single flat namespace, CHIP uses a split-horizon model that separates internal service discovery from public-facing resolution — ensuring that internal endpoints are never inadvertently exposed and that resolvers always return the most network-appropriate address for a given query.
+
+## Architecture Overview
+
+CHIP operates a two-tier DNS architecture consisting of **primary** and **secondary** resolvers deployed across availability zones for redundancy. Each resolver is authoritative for one or more internal zones and forwards unknown queries to upstream public resolvers only after exhausting the internal hierarchy.
+
+<CardGroup cols={2}>
+  <Card title="Primary Resolver" icon="server">
+    Handles all authoritative zone transfers, accepts dynamic DNS updates from CHIP automation, and serves as the primary SOA for internal zones.
+  </Card>
+  <Card title="Secondary Resolvers" icon="copy">
+    Receive zone transfers from the primary, answer queries locally, and provide failover coverage if the primary becomes unreachable.
+  </Card>
+  <Card title="Split-Horizon DNS" icon="arrows-split-up-and-left">
+    The same hostname can resolve to different addresses depending on which VLAN the query originates from — internal queries get RFC 1918 addresses, external queries get public IPs.
+  </Card>
+  <Card title="Upstream Forwarders" icon="arrow-up-right-from-square">
+    Queries for zones not hosted internally are forwarded to a pair of hardened recursive resolvers before reaching public DNS infrastructure.
+  </Card>
+</CardGroup>
+
+### Split-Horizon DNS
+
+Split-horizon (also called split-brain) DNS is central to CHIP's security posture. Two parallel views exist for the same zone:
+
+- **Internal view** — returned to clients resolving from RFC 1918 address space. Contains private A records, internal SRV endpoints, and management hostnames.
+- **External view** — returned to queries originating from public IP ranges. Exposes only intentionally published records and omits all internal topology.
+
+The resolver determines which view to serve based on the source IP of the incoming query, matched against Access Control Lists (ACLs) that are automatically maintained as VLANs are provisioned.
+
+---
+
+## Internal Domain Structure
+
+All internal resources are rooted under `corp.chiodo.local`. Sub-zones are delegated by function or environment:
+
+| Sub-Zone | Purpose |
+|---|---|
+| `infra.corp.chiodo.local` | Core infrastructure: hypervisors, storage arrays, switches |
+| `svc.corp.chiodo.local` | Platform services and APIs |
+| `mgmt.corp.chiodo.local` | Out-of-band management interfaces (IPMI, iDRAC) |
+| `dev.corp.chiodo.local` | Development environment workloads |
+| `staging.corp.chiodo.local` | Staging environment workloads |
+| `prod.corp.chiodo.local` | Production workloads |
+
+<Info>
+  The `mgmt.corp.chiodo.local` sub-zone is only resolvable from the dedicated management VLAN (VLAN 10). Queries from other VLANs receive `NXDOMAIN` by design.
+</Info>
+
+---
+
+## Zone Types Reference
+
+CHIP maintains both forward and reverse zones. The table below lists all authoritative zones, their types, purposes, and which resolver holds the primary copy.
+
+| Zone Name | Type | Purpose | Authoritative Server |
+|---|---|---|---|
+| `corp.chiodo.local` | Forward | Root internal zone; delegates sub-zones | `dns-primary-01.infra.corp.chiodo.local` |
+| `infra.corp.chiodo.local` | Forward | Infrastructure host records | `dns-primary-01.infra.corp.chiodo.local` |
+| `svc.corp.chiodo.local` | Forward | Platform service endpoints | `dns-primary-01.infra.corp.chiodo.local` |
+| `mgmt.corp.chiodo.local` | Forward | Management plane interfaces | `dns-primary-01.infra.corp.chiodo.local` |
+| `dev.corp.chiodo.local` | Forward | Development hosts and services | `dns-primary-02.infra.corp.chiodo.local` |
+| `staging.corp.chiodo.local` | Forward | Staging hosts and services | `dns-primary-02.infra.corp.chiodo.local` |
+| `prod.corp.chiodo.local` | Forward | Production hosts and services | `dns-primary-01.infra.corp.chiodo.local` |
+| `10.16.172.in-addr.arpa` | Reverse (PTR) | Management VLAN 10 reverse lookups | `dns-primary-01.infra.corp.chiodo.local` |
+| `20.16.172.in-addr.arpa` | Reverse (PTR) | Infrastructure VLAN 20 reverse lookups | `dns-primary-01.infra.corp.chiodo.local` |
+| `100.16.172.in-addr.arpa` | Reverse (PTR) | Production VLAN 100 reverse lookups | `dns-primary-01.infra.corp.chiodo.local` |
+
+---
+
+## Resolver Configuration per VLAN
+
+Each VLAN is assigned a resolver address from within its own subnet. CHIP's DHCP service automatically distributes the correct resolver IP as part of lease options, so workloads obtain the appropriate resolver without manual configuration.
+
+| VLAN | VLAN ID | Primary Resolver | Secondary Resolver |
+|---|---|---|---|
+| Management | 10 | `172.16.10.2` | `172.16.10.3` |
+| Infrastructure | 20 | `172.16.20.2` | `172.16.20.3` |
+| Development | 50 | `172.16.50.2` | `172.16.50.3` |
+| Staging | 75 | `172.16.75.2` | `172.16.75.3` |
+| Production | 100 | `172.16.100.2` | `172.16.100.3` |
+
+<Tip>
+  Statically configured hosts (e.g., bare-metal servers with fixed IPs) should always specify both the primary and secondary resolver for their VLAN to ensure continued resolution during maintenance windows.
+</Tip>
+
+### Upstream Forwarders
+
+When a resolver cannot answer a query from its local zone data, it forwards the query to the platform's recursive resolver tier before going to public DNS:
+
+1. `172.16.20.10` — Internal recursive resolver, caches public DNS responses
+2. `172.16.20.11` — Internal recursive resolver, hot standby
+3. `9.9.9.9` — Quad9 (used only if both internal recursors are unreachable)
+
+---
+
+## DNS Record Types
+
+CHIP uses the following DNS record types across its internal zones:
+
+<AccordionGroup>
+  <Accordion title="A — IPv4 Host Record">
+    Maps a hostname to an IPv4 address. Every managed host in CHIP receives an A record automatically upon provisioning.
+
+    ```dns
+    web-prod-01.prod.corp.chiodo.local.  300  IN  A  172.16.100.45
+    ```
+  </Accordion>
+  <Accordion title="CNAME — Canonical Name Alias">
+    Creates an alias from one name to another. Used for service endpoints that need to be redirected without changing IP-level records.
+
+    ```dns
+    api.prod.corp.chiodo.local.  300  IN  CNAME  web-prod-01.prod.corp.chiodo.local.
+    ```
+  </Accordion>
+  <Accordion title="PTR — Reverse Lookup Record">
+    Maps an IP address back to a hostname. Required for management tooling, logging correlation, and some authentication flows.
+
+    ```dns
+    45.100.16.172.in-addr.arpa.  300  IN  PTR  web-prod-01.prod.corp.chiodo.local.
+    ```
+  </Accordion>
+  <Accordion title="SRV — Service Locator Record">
+    Advertises the location of a named service including priority, weight, port, and target. Used by CHIP's internal service discovery framework.
+
+    ```dns
+    ; _service._proto.name  TTL  class  SRV  priority  weight  port  target
+    _https._tcp.api.svc.corp.chiodo.local.  60  IN  SRV  10  20  443  web-prod-01.prod.corp.chiodo.local.
+    ```
+  </Accordion>
+  <Accordion title="TXT — Text Record">
+    Stores arbitrary text data. Used for service ownership annotations, certificate validation tokens, and SPF/DKIM records on externally routable zones.
+
+    ```dns
+    web-prod-01.prod.corp.chiodo.local.  300  IN  TXT  "owner=platform-team env=production tier=web"
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Example Zone File
+
+The following is an abbreviated zone file for `prod.corp.chiodo.local` illustrating SOA, NS, A, CNAME, SRV, and PTR record patterns used in CHIP:
+
+```dns
+; Zone: prod.corp.chiodo.local
+; Last modified: 2025-01-15
+; Managed by CHIP DNS automation — manual edits will be overwritten
+
+$ORIGIN prod.corp.chiodo.local.
+$TTL 300
+
+@   IN  SOA  dns-primary-01.infra.corp.chiodo.local. hostmaster.corp.chiodo.local. (
+            2025011501  ; Serial (YYYYMMDDnn)
+            3600        ; Refresh
+            900         ; Retry
+            604800      ; Expire
+            300 )       ; Negative cache TTL
+
+; Name servers
+@   IN  NS  dns-primary-01.infra.corp.chiodo.local.
+@   IN  NS  dns-primary-02.infra.corp.chiodo.local.
+
+; Web tier
+web-prod-01     IN  A      172.16.100.45
+web-prod-02     IN  A      172.16.100.46
+web-prod-03     IN  A      172.16.100.47
+api             IN  CNAME  web-prod-01
+
+; Database tier
+db-prod-01      IN  A      172.16.100.60
+db-prod-02      IN  A      172.16.100.61
+db-primary      IN  CNAME  db-prod-01
+db-replica      IN  CNAME  db-prod-02
+
+; Service discovery
+_postgres._tcp  IN  SRV  10  50  5432  db-prod-01.prod.corp.chiodo.local.
+_postgres._tcp  IN  SRV  20  50  5432  db-prod-02.prod.corp.chiodo.local.
+_https._tcp.api IN  SRV  10  20   443  web-prod-01.prod.corp.chiodo.local.
+
+; Ownership annotations
+web-prod-01     IN  TXT  "owner=platform-team env=production tier=web"
+db-prod-01      IN  TXT  "owner=dba-team env=production tier=data"
+```
+
+---
+
+## DNS-Based Service Discovery
+
+CHIP's service discovery system publishes SRV records automatically when a workload is registered with the platform. Consumers can locate a service by querying the standard `_service._proto.zone` pattern rather than hardcoding IPs or hostnames.
+
+```bash
+# Discover all PostgreSQL endpoints in production
+dig SRV _postgres._tcp.prod.corp.chiodo.local
+
+# Discover HTTPS API endpoints
+dig SRV _https._tcp.api.svc.corp.chiodo.local
+```
+
+When a workload scales out or a node fails, CHIP updates the relevant SRV records within the configured TTL window. Clients that respect DNS TTLs will automatically pick up new endpoints without reconfiguration.
+
+<Info>
+  Service discovery SRV records use a TTL of 60 seconds by default to allow rapid failover. Do not cache these records beyond their TTL in application-layer connection pools.
+</Info>
+
+---
+
+## Adding a New DNS Record
+
+<Warning>
+  During migrations or IP address changes, lowering the TTL of existing records **at least 2× the original TTL in advance** is critical. If you change an A record with a 300-second TTL and downstream resolvers have already cached it, those clients will continue resolving the old address until their cache expires. Plan TTL changes 24–48 hours before any migration cutover to ensure a clean transition.
+</Warning>
+
+<Steps>
+  <Step title="Identify the target zone">
+    Determine which zone the new record belongs to based on the host's environment and function. Use the [Internal Domain Structure](#internal-domain-structure) table above to pick the correct sub-zone (e.g., a production web server belongs in `prod.corp.chiodo.local`).
+  </Step>
+  <Step title="Verify the IP address or target hostname">
+    Confirm the IP address (for A records) or target hostname (for CNAME, SRV) is correct and already reachable on the appropriate VLAN. Adding a DNS record for an unreachable host can cause silent failures in service discovery.
+
+    ```bash
+    # Verify host is reachable before creating the record
+    ping -c 3 172.16.100.52
+    ```
+  </Step>
+  <Step title="Choose an appropriate TTL">
+    Use the standard TTL of `300` seconds for most records. Reduce to `60` seconds for service discovery SRV records or any record that may change frequently. Use `3600` seconds only for stable infrastructure records (e.g., resolver addresses, NTP servers) that almost never change.
+  </Step>
+  <Step title="Submit the record via the CHIP portal">
+    Navigate to **Network → DNS → Manage Records** in the CHIP portal. Select the target zone, choose the record type, and fill in the required fields. Records submitted through the portal are validated against zone ACLs before being applied.
+
+    ```bash
+    # Alternatively, use the CHIP CLI
+    chip dns record add \
+      --zone prod.corp.chiodo.local \
+      --name web-prod-04 \
+      --type A \
+      --value 172.16.100.52 \
+      --ttl 300
+    ```
+  </Step>
+  <Step title="Verify propagation">
+    After submission, confirm the record has propagated to both the primary and secondary resolvers. Allow up to 60 seconds for zone transfers to complete.
+
+    ```bash
+    # Query the primary resolver directly
+    dig @172.16.100.2 web-prod-04.prod.corp.chiodo.local A
+
+    # Query the secondary resolver to confirm zone transfer
+    dig @172.16.100.3 web-prod-04.prod.corp.chiodo.local A
+    ```
+  </Step>
+  <Step title="Create the corresponding PTR record">
+    For any A record you add, submit a matching PTR record in the appropriate reverse zone. This is required for logging correlation and management tooling to function correctly.
+
+    ```bash
+    chip dns record add \
+      --zone 100.16.172.in-addr.arpa \
+      --name 52 \
+      --type PTR \
+      --value web-prod-04.prod.corp.chiodo.local. \
+      --ttl 300
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Modifying Existing Records
+
+To modify an existing DNS record, use the CHIP portal's **Edit Record** function or the CLI `chip dns record update` command. The platform retains the previous value in an audit log for 90 days, which you can review with:
+
+```bash
+chip dns record history --zone prod.corp.chiodo.local --name web-prod-01
+```
+
+<Note>
+  CHIP does not support in-place TTL changes on records that carry active SRV referrals. If you need to change the TTL of such a record, you must first remove the SRV referral, update the TTL, and then re-add the SRV record. The CLI will warn you if this condition is detected.
+</Note>
