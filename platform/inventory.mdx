@@ -204,12 +204,12 @@ The inventory is only valuable if it accurately reflects reality. CHIP recommend
     Add a host entry to the inventory before you power on the physical machine or create the VM. Assign the hostname, IP, VLAN, and role in advance. This prevents ad-hoc assignments made under pressure.
   </Step>
   <Step title="Validate on First Boot">
-    After provisioning, run the CHIP inventory validation script to confirm that the node's reported hardware matches the declared spec, that its IP matches the DHCP reservation, and that its monitoring agent is reachable.
+    After provisioning, verify that the node's reported hardware matches the declared spec: confirm the assigned IP is reachable, the DHCP reservation is in place, and the monitoring agent (node exporter) is returning metrics in the observability stack.
   </Step>
   <Step title="Update on Change">
-    Any time a node's hardware, role, or IP changes — open a pull request against the inventory file before making the change in production. The PR description becomes the change record.
+    Any time a node's hardware, role, or IP changes — update the inventory file and commit the change before applying it in production. The commit message serves as the change record for that modification.
   </Step>
   <Step title="Audit Quarterly">
-    Run a full inventory audit every quarter by cross-referencing the declared inventory against the Proxmox cluster API, the DHCP lease table, and Prometheus scrape targets. Resolve discrepancies within the same sprint.
+    Run a full inventory audit every quarter by cross-referencing the declared inventory against the Proxmox cluster API, the DHCP lease table, and Prometheus scrape targets. Resolve any discrepancies promptly, within two weeks of the audit.
   </Step>
 </Steps>

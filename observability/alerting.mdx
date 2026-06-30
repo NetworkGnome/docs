@@ -1,5 +1,5 @@
 ---
-title: "Alerting Pipeline and On-Call Routing in CHIP"
+title: "Alerting Pipeline, On-Call Routing, and Alert Rules in CHIP"
 sidebarTitle: "Alerting"
 description: "Understand CHIP's alerting pipeline, severity levels, routing rules, and how to create, silence, and manage alert rules using Alertmanager."
 ---
@@ -131,7 +131,7 @@ groups:
           description: >
             CPU utilisation on {{ $labels.instance }} has been above 90% for
             more than 10 minutes. Current value: {{ $value | humanize }}%.
-          runbook_url: "https://runbooks.internal/chip/high-cpu"
+          runbook_url: "https://runbooks.example.com/chip/high-cpu"
 
       - alert: CriticalCPUUsage
         expr: |
@@ -149,7 +149,7 @@ groups:
           description: >
             CPU utilisation on {{ $labels.instance }} has exceeded 98% for
             more than 5 minutes. Immediate investigation required.
-          runbook_url: "https://runbooks.internal/chip/critical-cpu"
+          runbook_url: "https://runbooks.example.com/chip/critical-cpu"
 ```
 
 ## Silencing Alerts During Maintenance

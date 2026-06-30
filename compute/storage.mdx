@@ -1,5 +1,5 @@
 ---
-title: "Storage Architecture, Pools & Management in CHIP"
+title: "Storage Architecture, Pools, and Management in CHIP"
 sidebarTitle: "Storage"
 description: "CHIP storage tiers, pool reference, ZFS and Ceph backends, snapshot policies, backup targets, and procedures for adding and managing VM storage."
 ---
@@ -249,5 +249,5 @@ Storage health metrics are exported to Prometheus via the `proxmox-exporter` and
 | `PBSDatastoreLow`           | PBS datastore free space < 10 TB       | Warning  | `runbooks/storage/pbs-capacity.md`   |
 
 <Note>
-  Runbooks are hosted in the internal GitLab repository at `gitlab.chip.internal/infra/runbooks`. All on-call engineers must review the storage runbooks during onboarding to ensure fast response times when alerts fire outside business hours.
+  Runbook paths shown in the table above are relative to the CHIP internal runbook repository. All on-call engineers must review the storage runbooks during onboarding to ensure fast response times when alerts fire outside business hours.
 </Note>

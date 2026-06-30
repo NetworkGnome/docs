@@ -1,5 +1,5 @@
 ---
-title: "Ingress: Reverse Proxy & TLS Termination Layer"
+title: "Ingress: Traefik Reverse Proxy and TLS Termination"
 sidebarTitle: "Ingress"
 description: "Traefik-based ingress architecture, TLS certificate management, hostname routing rules, middleware configuration, and service exposure procedures."
 ---
@@ -19,7 +19,7 @@ Internet / LAN
  ┌───────────────────────────────────────┐
  │  Traefik (proxy-ingress stack)        │
  │  Entrypoints: :80 (web), :443 (websecure) │
- │  Dashboard:   :8080 (LAN only)        │
+ │  Dashboard:   traefik.chip.example.com (LAN only) │
  └──────┬──────────────┬─────────────────┘
         │              │
         ▼              ▼
@@ -308,10 +308,10 @@ Think carefully before exposing any service to the WAN. Every WAN-exposed servic
   <Step title="Verify the route appears in the Traefik dashboard">
     Open the Traefik dashboard at `https://traefik.chip.example.com` (LAN access) and confirm the new router appears under **HTTP → Routers** with status **Enabled**.
 
-    Alternatively, check via the Traefik API:
+    Alternatively, check via the Traefik API (requires authentication through the configured router):
 
     ```bash
-    curl -s http://localhost:8080/api/http/routers | jq '.[] | select(.name=="my-service@docker")'
+    curl -s https://traefik.chip.example.com/api/http/routers | jq '.[] | select(.name=="my-service@docker")'
     ```
   </Step>
   <Step title="Test the route end to end">
@@ -367,11 +367,11 @@ Certificates are issued and renewed automatically by Traefik using the Let's Enc
     | openssl x509 -noout -dates -subject
   ```
 
-  To inspect the raw `acme.json` store (requires `jq`):
+  To list all domains stored in the `acme.json` store (requires `jq`):
 
   ```bash
-  sudo cat /opt/chip/config/proxy-ingress/traefik/acme/acme.json \
-    | jq '.letsencrypt.Certificates[] | {domain: .domain.main, expiry: .certificate}' 2>/dev/null
+  sudo jq '.letsencrypt.Certificates[].domain' \
+    /opt/chip/config/proxy-ingress/traefik/acme/acme.json
   ```
 </Accordion>
 

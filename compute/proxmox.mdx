@@ -136,7 +136,7 @@ The Proxmox REST API is available at the same base URL. CHIP issues dedicated AP
 
 # Example: list all VMs using an API token
 curl -s \
-  -H "Authorization: PVEAPIToken=automation@pve!chip-ci=<token-secret>" \
+  -H "Authorization: PVEAPIToken=automation@pve!automation-token=<token-secret>" \
   https://proxmox.chip.internal:8006/api2/json/cluster/resources?type=vm \
   | jq '.data[] | {vmid, name, status, node}'
 ```
@@ -155,7 +155,7 @@ Proxmox uses a **path-based permission model**. Permissions are granted as `(use
 |--------------------|-------------------------------------------------------------|----------------------------------|
 | `PVEVMUser`        | Start, stop, console access to VMs                          | Application team members         |
 | `PVEVMAdmin`       | Full VM lifecycle: create, delete, snapshot, migrate        | Platform engineers               |
-| `PVEDatastoreUser` | Read storage, create VM disks                               | CI/CD service accounts           |
+| `PVEDatastoreUser` | Read storage, create VM disks                               | Automation service accounts      |
 | `PVEAdmin`         | All privileges except modifying cluster-wide config         | Senior infrastructure engineers  |
 | `Administrator`    | Unrestricted access                                         | Break-glass accounts (MFA gated) |
 

@@ -1,7 +1,7 @@
 ---
-title: "Firewall Architecture and Rule Management in CHIP"
+title: "CHIP Firewall Architecture and Rule Management Guide"
 sidebarTitle: "Firewall"
-description: "Learn CHIP's firewall zones, default-deny posture, rule ordering, logging policy, and how to request or review firewall rule changes."
+description: "Explore CHIP's layered firewall model: zone trust levels, default-deny posture, rule ordering, logging policy, and how to submit firewall rule changes."
 ---
 
 CHIP's firewall infrastructure enforces network segmentation at every boundary in the platform — from the edge where your traffic meets the public internet, to the inter-VLAN boundaries between internal segments, down to host-level policy applied by the platform's distributed enforcement layer. Every packet that crosses a zone boundary is subject to stateful inspection, and the platform's default posture is to deny traffic unless an explicit rule permits it.
@@ -35,13 +35,11 @@ Each VLAN maps to exactly one firewall zone. Zones have an assigned trust level 
 | Zone | VLAN(s) | Trust Level | Description |
 |---|---|---|---|
 | `WAN` | — | Untrusted | Public internet. All traffic denied inbound by default. |
-| `DMZ` | VLAN 5 | Low | Public-facing services: load balancers, reverse proxies. |
-| `MGMT` | VLAN 10 | High | Out-of-band management: IPMI, iDRAC, network device management. |
-| `INFRA` | VLAN 20 | High | Platform infrastructure: hypervisors, storage, DNS, NTP. |
-| `DEV` | VLAN 50 | Medium | Development workloads. |
-| `STAGING` | VLAN 75 | Medium | Staging workloads. |
-| `PROD` | VLAN 100 | Medium | Production application workloads. |
-| `BACKUP` | VLAN 110 | High | Backup and replication traffic. |
+| `MGMT` | VLAN 10 | High | Infrastructure management: hypervisors, switches, IPMI, router UI. |
+| `TRUSTED` | VLAN 20 | High | User workstations, laptops, and trusted personal devices. |
+| `IOT` | VLAN 30 | Low | Smart home devices, sensors, cameras, and embedded systems. |
+| `DMZ` | VLAN 40 | Low | Internet-facing services: reverse proxy, publicly reachable APIs. |
+| `STORAGE` | VLAN 50 | High | NFS/iSCSI storage traffic between hypervisors and storage nodes. |
 
 <Info>
   Trust level does not automatically grant access between zones of the same level. Every inter-zone flow requires an explicit permit rule regardless of trust level. Trust level governs the *default-deny disposition* for unsolicited traffic — high-trust zones are more likely to be permitted as a destination by platform-wide service rules, but never as a source without explicit policy.
@@ -83,23 +81,16 @@ The table below documents the active platform-level rules that CHIP ships with. 
 
 | Rule # | Source Zone | Destination Zone | Protocol / Port | Action | Description |
 |---|---|---|---|---|---|
-| 100 | `WAN` | `DMZ` | TCP / 443 | PERMIT | HTTPS ingress to load balancers |
+| 100 | `WAN` | `DMZ` | TCP / 443 | PERMIT | HTTPS ingress to reverse proxy |
 | 101 | `WAN` | `DMZ` | TCP / 80 | PERMIT | HTTP ingress (redirect to HTTPS) |
-| 200 | `DMZ` | `PROD` | TCP / 8080–8090 | PERMIT | LB to app tier backend pool |
-| 201 | `DMZ` | `PROD` | TCP / 443 | PERMIT | LB to app tier HTTPS backends |
-| 300 | `PROD` | `INFRA` | TCP+UDP / 53 | PERMIT | Production DNS resolution |
-| 301 | `PROD` | `INFRA` | UDP / 123 | PERMIT | Production NTP sync |
-| 302 | `PROD` | `INFRA` | TCP / 5432 | PERMIT | Production → database tier |
-| 400 | `STAGING` | `INFRA` | TCP+UDP / 53 | PERMIT | Staging DNS resolution |
-| 401 | `STAGING` | `INFRA` | UDP / 123 | PERMIT | Staging NTP sync |
-| 500 | `DEV` | `INFRA` | TCP+UDP / 53 | PERMIT | Dev DNS resolution |
-| 501 | `DEV` | `INFRA` | UDP / 123 | PERMIT | Dev NTP sync |
-| 600 | `MGMT` | `ANY` | TCP / 22 | PERMIT | SSH from management zone to all |
-| 601 | `MGMT` | `ANY` | TCP / 443 | PERMIT | HTTPS management API access |
-| 700 | `INFRA` | `BACKUP` | TCP / 9100 | PERMIT | Backup agent data transfer |
-| 701 | `BACKUP` | `INFRA` | TCP / 9100 | PERMIT | Backup controller to agents |
-| 800 | `PROD` | `WAN` | TCP / 443 | PERMIT | Production egress for external APIs |
-| 801 | `PROD` | `WAN` | TCP / 80 | PERMIT | Production egress HTTP (package mirrors) |
+| 200 | `DMZ` | `TRUSTED` | TCP / 443 | PERMIT | Reverse proxy to internal service backends |
+| 201 | `DMZ` | `MGMT` | TCP / 443 | PERMIT | Reverse proxy to management service APIs |
+| 300 | `TRUSTED` | `WAN` | TCP / 80, 443 | PERMIT | User web browsing and cloud access |
+| 301 | `TRUSTED` | `DMZ` | TCP / 443 | PERMIT | User access to internally-hosted services |
+| 400 | `IOT` | `WAN` | TCP / 443 | PERMIT | IoT device firmware updates and telemetry |
+| 500 | `MGMT` | `ANY` | TCP / 22 | PERMIT | SSH from management zone to all |
+| 501 | `MGMT` | `ANY` | TCP / 443 | PERMIT | HTTPS management API access from MGMT |
+| 600 | `STORAGE` | `MGMT` | TCP / 2049, 3260 | PERMIT | NFS/iSCSI from hypervisors to storage |
 | 999 | `ANY` | `ANY` | ANY | DENY | Implicit deny-all (platform-managed) |
 
 ---
@@ -117,19 +108,19 @@ The table below documents the active platform-level rules that CHIP ships with. 
     **WAN → DMZ HTTPS ingress:**
     ```text
     Source:      WAN (any)
-    Destination: dmz-lb-vip (172.16.5.10)
+    Destination: proxy-01 (10.0.40.10)
     Protocol:    TCP
     Port:        443
     Action:      PERMIT
     Log:         YES
     ```
 
-    **DMZ → PROD application backend:**
+    **DMZ → Trusted LAN application backend:**
     ```text
-    Source:      dmz-lb-pool (172.16.5.0/28)
-    Destination: prod-app-tier (172.16.100.32/27)
+    Source:      DMZ (10.0.40.0/24)
+    Destination: trusted-app-hosts (10.0.20.32/27)
     Protocol:    TCP
-    Port:        8080-8090
+    Port:        443
     Action:      PERMIT
     Log:         YES (sampled at 1:10 in steady state)
     ```
@@ -148,32 +139,32 @@ The table below documents the active platform-level rules that CHIP ships with. 
   <Tab title="Outbound Rules">
     Outbound rules govern egress from internal zones toward `WAN` or from higher-trust zones toward lower-trust zones. CHIP applies egress filtering to prevent data exfiltration and to ensure workloads only communicate with authorized external services.
 
-    **PROD → WAN for external API access:**
+    **Trusted LAN → WAN for web browsing and cloud services:**
     ```text
-    Source:      prod-app-tier (172.16.100.32/27)
+    Source:      TRUSTED (10.0.20.0/24)
     Destination: WAN (any)
-    Protocol:    TCP
-    Port:        443
-    Action:      PERMIT
-    Log:         YES
-    Note:        Combined with DNS RPZ to block known-bad domains
-    ```
-
-    **DEV → WAN restricted to package mirrors only:**
-    ```text
-    Source:      dev-workloads (172.16.50.0/24)
-    Destination: mirror.chiodo.internal (proxy egress)
     Protocol:    TCP
     Port:        80, 443
     Action:      PERMIT
     Log:         YES
-    Note:        Dev does not get direct WAN egress; traffic is proxied
+    Note:        Combined with DNS blocklist to filter known-bad domains
     ```
 
-    **Blocking PROD → DEV lateral movement:**
+    **IoT → WAN restricted to vendor endpoints:**
     ```text
-    Source:      prod-app-tier (172.16.100.0/24)
-    Destination: DEV zone (172.16.50.0/24)
+    Source:      IOT (10.0.30.0/24)
+    Destination: WAN (approved vendor ranges only)
+    Protocol:    TCP
+    Port:        443
+    Action:      PERMIT
+    Log:         YES
+    Note:        IoT does not get unrestricted WAN egress; destination is filtered
+    ```
+
+    **Blocking DMZ → Trusted LAN lateral movement:**
+    ```text
+    Source:      DMZ (10.0.40.0/24)
+    Destination: TRUSTED (10.0.20.0/24)
     Protocol:    ANY
     Port:        ANY
     Action:      DENY
@@ -216,7 +207,7 @@ Firewall logs are queryable in real time from the CHIP portal or via the CLI:
 chip firewall logs --action DENY --limit 50
 
 # Show all traffic from a specific source in the last hour
-chip firewall logs --src 172.16.50.42 --since 1h
+chip firewall logs --src 10.0.30.42 --since 1h
 
 # Show traffic to a specific destination port
 chip firewall logs --dst-port 5432 --zone-pair PROD:INFRA --since 24h
@@ -243,17 +234,17 @@ All firewall rule additions, modifications, and deletions must go through a form
     # Apply to staging for testing
     chip firewall rule add \
       --env staging \
-      --src-zone PROD \
-      --dst-zone INFRA \
-      --src 172.16.100.32/27 \
-      --dst 172.16.20.60 \
+      --src-zone DMZ \
+      --dst-zone TRUSTED \
+      --src 10.0.40.32/27 \
+      --dst 10.0.20.60 \
       --proto tcp \
       --port 6379 \
       --action permit \
-      --description "prod app tier to Redis cache"
+      --description "DMZ reverse proxy to internal cache service"
 
     # Test connectivity from a staging workload
-    nc -zv 172.16.20.60 6379
+    nc -zv 10.0.20.60 6379
     ```
   </Step>
   <Step title="Submit the change request">

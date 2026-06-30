@@ -1,7 +1,7 @@
 ---
 title: "CHIP Security Posture and Defense-in-Depth Overview"
 sidebarTitle: "Overview"
-description: "Understand CHIP's layered security model, zero-trust principles, security controls across every infrastructure tier, and the vulnerability management process."
+description: "Understand CHIP's layered security model, zero-trust principles, and security controls at every infrastructure tier, including vulnerability management."
 ---
 
 CHIP is built around a defense-in-depth philosophy: no single control is trusted as sufficient, and every layer of the platform assumes that adjacent layers can be compromised. Rather than relying on a hardened perimeter alone, CHIP applies security controls at the network, host, service, identity, and data layers simultaneously. This layered approach ensures that the compromise of one control — a misconfigured firewall rule, a leaked credential, or an unpatched library — does not translate directly into a full platform breach. Zero-trust principles further reinforce this model: every connection, whether from a human operator or a service account, must be authenticated and authorized regardless of its origin network.

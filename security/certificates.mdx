@@ -1,7 +1,7 @@
 ---
 title: "TLS Certificate Management and Internal CA in CHIP"
 sidebarTitle: "Certificates"
-description: "Manage TLS certificates in CHIP using cert-manager, the internal CA, and Let's Encrypt ACME. Learn issuance, renewal, inventory tracking, and trust distribution."
+description: "Automate TLS certificate lifecycle in CHIP with cert-manager and Let's Encrypt. Covers internal CA issuance, renewal procedures, and CA trust distribution."
 ---
 
 CHIP enforces TLS encryption on every internal and external connection, which means certificate lifecycle management is a critical operational function. Certificates that expire unnoticed cause outages; certificates issued with weak configurations create security vulnerabilities. To eliminate both risks, CHIP automates certificate issuance and renewal through [cert-manager](https://cert-manager.io/) running inside the platform's Kubernetes control cluster, backed by two certificate authorities: the CHIP internal CA (for service-to-service and management plane certificates) and Let's Encrypt (for publicly trusted certificates on internet-facing endpoints). This page explains each certificate type, how the automation works, how to handle edge cases that require manual intervention, and how trust is distributed across the platform.

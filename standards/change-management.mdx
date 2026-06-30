@@ -87,7 +87,7 @@ For most infrastructure changes, you will follow the standard change workflow:
     Your PR description should summarize the change, link to the change record, and note the target maintenance window.
   </Step>
   <Step title="Schedule the maintenance window">
-    Book a maintenance window in the shared infrastructure calendar. The window must be long enough to execute the change and complete verification, plus buffer time for rollback if needed. Notify affected service owners via the `#infrastructure-changes` Slack channel at least 24 hours in advance.
+    Book a maintenance window in the shared infrastructure calendar. The window must be long enough to execute the change and complete verification, plus buffer time for rollback if needed. Notify affected service owners via the designated infrastructure changes channel at least 24 hours in advance.
 
     <Tip>
     Consult the maintenance runbook for the affected system before the change window. It contains system-specific pre-checks, known failure modes, and escalation contacts that are easy to miss under pressure.
@@ -127,7 +127,7 @@ CHIP has two recurring maintenance windows per week. Standard and normal changes
 
 ### Requesting an Off-Cycle Window
 
-If a change cannot wait for the next standard window, request an off-cycle window by posting in `#infrastructure-changes` with the following information: the change type, estimated duration, affected services, and reason the scheduled window cannot be used. Off-cycle windows require team lead approval.
+If a change cannot wait for the next standard window, request an off-cycle window by notifying the team via the designated infrastructure changes channel with the following information: the change type, estimated duration, affected services, and reason the scheduled window cannot be used. Off-cycle windows require team lead approval.
 
 ## Rollback Criteria
 
@@ -145,19 +145,19 @@ Do not attempt to diagnose and fix a failing change during the maintenance windo
 
 ### Before a Change
 
-- Post in `#infrastructure-changes` at least 24 hours before standard changes, 72 hours before normal changes
+- Notify the team via the designated infrastructure changes channel at least 24 hours before standard changes, 72 hours before normal changes
 - Tag affected service owners directly if the change may cause downtime
 - Include: change type, affected systems, expected impact, maintenance window time
 
 ### During a Change
 
-- Post a start notification in `#infrastructure-changes` when the maintenance window opens
+- Post a start notification in the designated infrastructure changes channel when the maintenance window opens
 - Post status updates if the change is taking longer than planned
 - Escalate to team lead if you encounter unexpected behavior
 
 ### After a Change
 
-- Post a completion summary in `#infrastructure-changes` (success or rollback)
+- Post a completion summary in the designated infrastructure changes channel (success or rollback)
 - Update the change record with the actual outcome
 - If a rollback was performed, open a follow-up ticket to address the root cause
 

@@ -1,5 +1,5 @@
 ---
-title: "Access Control for Operators and Services in CHIP"
+title: "Access Control: Operators, Services, and SSH Keys in CHIP"
 sidebarTitle: "Access Control"
 description: "Learn how CHIP manages operator and service access through SSH key management, RBAC, MFA, VPN requirements, and the service account authentication model."
 ---
@@ -145,7 +145,7 @@ Never share your CHIP credentials, SSH private keys, or service account tokens w
     A `Platform Admin` generates a WireGuard VPN profile for the operator in **Settings → VPN → Users → Generate Profile**. Download the `.conf` file and share it with the operator over an encrypted channel (Signal, 1Password shared item, or similar). The operator imports it into their WireGuard client.
   </Step>
   <Step title="Verify access and update the access registry">
-    Ask the operator to confirm they can log in to the CHIP control plane with MFA, connect to the VPN, and SSH to at least one assigned host. Update the access registry spreadsheet (linked in the CHIP runbooks) with the operator's details and provisioning date.
+    Ask the operator to confirm they can log in to the CHIP control plane with MFA, connect to the VPN, and SSH to at least one assigned host. Record the operator's details and provisioning date in your team's access registry.
   </Step>
 </Steps>
 

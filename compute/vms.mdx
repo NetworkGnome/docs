@@ -1,5 +1,5 @@
 ---
-title: "VM & LXC Container Management in Proxmox VE"
+title: "VM and LXC Container Lifecycle Management in Proxmox"
 sidebarTitle: "VMs & Containers"
 description: "Manage virtual machines and LXC containers on CHIP: creation, templates, cloud-init, lifecycle operations, naming conventions, and resource limits."
 ---
@@ -158,7 +158,7 @@ For Terraform-based provisioning, CHIP provides a reusable module in the interna
 
 ```hcl
 module "vm" {
-  source       = "registry.chip.internal/compute/proxmox-vm/chip"
+  source       = "chip/proxmox-vm/compute"
   version      = "~> 2.0"
 
   vm_id        = 200

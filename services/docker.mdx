@@ -1,5 +1,5 @@
 ---
-title: "Docker Runtime Environment & Host Configuration"
+title: "Docker Runtime: Host Configuration and Service Deployment"
 sidebarTitle: "Docker"
 description: "Docker daemon setup, host inventory, networking models, image management, and security practices for the CHIP infrastructure platform."
 ---
@@ -24,7 +24,7 @@ All production hosts are joined to their respective VLANs at the hypervisor leve
 
 ## Docker Daemon Configuration
 
-The daemon on every CHIP host is managed through `/etc/docker/daemon.json`. A canonical baseline configuration is applied during provisioning via the platform's Ansible role and looks like the following.
+The daemon on every CHIP host is managed through `/etc/docker/daemon.json`. A canonical baseline configuration is applied to all hosts during provisioning and looks like the following.
 
 ```json
 {

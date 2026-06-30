@@ -211,7 +211,7 @@ ANSIBLE_VAULT_PASSWORD_FILE=~/.vault_pass \
 ```
 
 <Info>
-The vault password file (`~/.vault_pass`) must never be committed to Git. It is provisioned to authorized operators via the team password manager. In CI/CD pipelines, the vault password is injected as an environment secret.
+The vault password file (`~/.vault_pass`) must never be committed to Git. It is provisioned to authorized operators via the team password manager. In automated execution contexts, supply the vault password through a secure environment variable or secrets manager rather than a file on disk.
 </Info>
 
 ### Adding a New Secret

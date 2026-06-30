@@ -311,8 +311,9 @@ Every maintenance window — regardless of scope — follows this standard seque
     Roll back to the previous image tag if the updated container is unhealthy:
 
     ```bash
-    # Compose
-    docker compose up -d --no-deps --image <registry>/<image-name>:<previous-tag> <service-name>
+    # Compose — update the image tag in your compose file, then re-deploy the service
+    # Edit docker-compose.<stack>.yml: change the image tag back to <previous-tag>, then:
+    docker compose up -d --no-deps <service-name>
 
     # Swarm
     docker service rollback <stack>_<service>

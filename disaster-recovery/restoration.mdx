@@ -397,12 +397,14 @@ If a Proxmox node itself is unrecoverable (hardware failure, storage failure), a
     Add the PBS datastore as a storage backend on the new Proxmox node.
 
     ```bash
-    pvsh set /storage/<pbs-storage-id> \
+    pvesm add pbs <pbs-storage-id> \
       --server <pbs-host> \
       --datastore <datastore-name> \
       --username <pbs-user>@pam \
-      --password <pbs-password>
+      --fingerprint <pbs-server-fingerprint>
     ```
+
+    Retrieve the PBS server fingerprint from the PBS web UI under **Administration → Certificates**, or from an existing cluster node with `pvesm status`. The fingerprint authenticates the connection without embedding a plaintext password in the command.
   </Step>
   <Step title="Restore VMs and containers in priority order">
     Restore Tier 1 services first, following the VM or LXC restoration procedures above. Use the service criticality table in the [DR Strategy](/disaster-recovery/strategy) to determine the correct restoration order.

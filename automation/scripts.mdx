@@ -200,7 +200,9 @@ main "$@"
     Run the script against a dev or staging host first. Run with `--dry-run` first, then with `--verbose` to confirm logging behavior, then with a live run to validate the actual outcome.
 
     ```bash
-    ssh dev-host01 'bash -s' < automation/scripts/bash/my-new-script.sh --dry-run
+    # Copy to host and run with --dry-run
+    scp automation/scripts/bash/my-new-script.sh dev-host01:/tmp/
+    ssh dev-host01 'bash /tmp/my-new-script.sh --dry-run'
     ```
   </Step>
   <Step title="Add an entry to the script reference table">
